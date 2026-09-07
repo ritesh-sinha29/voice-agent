@@ -87,37 +87,14 @@ function generateSyntheticSpeechPcm(durationSec: number = 1.5, sampleRate: numbe
 }
 
 // High-Fidelity Human Speech Synthesis
-async function synthesizeHumanSpeech(text: string, voice: string = 'mulberry'): Promise<Buffer> {
+async function synthesizeHumanSpeech(text: string, voice: string = 'asteria'): Promise<Buffer> {
+  const ttsProvider = (process.env.TTS_PROVIDER || 'deepgram').toLowerCase();
+  const deepgramKey = process.env.DEEPGRAM_API_KEY;
   const rumikKey = process.env.RUMIK_API_KEY;
   const rumikUrl = process.env.RUMIK_GATEWAY_URL || 'https://silk-api.rumik.ai';
 
-  // 1. Primary: Rumik Silk Mulberry Studio Voice (24kHz WAV)
-  if (rumikKey) {
-    try {
-      const resp = await fetch(`${rumikUrl}/v1/tts`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${rumikKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ text, voice })
-      });
-      if (resp.ok) {
-        const arrayBuf = await resp.arrayBuffer();
-        const buffer = Buffer.from(arrayBuf);
-        if (buffer.length > 200) {
-          console.log(`[Rumik TTS] Synthesized ${buffer.length} bytes of studio voice (${voice})`);
-          return buffer;
-        }
-      }
-    } catch (e: any) {
-      console.warn('[Rumik TTS] Error:', e.message);
-    }
-  }
-
-  // 2. Secondary: Deepgram Aura Neural TTS Fallback
-  const deepgramKey = process.env.DEEPGRAM_API_KEY;
-  if (deepgramKey) {
+  // 1. Primary: Deepgram Aura Neural TTS (~600ms latency for streaming sentences)
+  if (ttsProvider === 'deepgram' && deepgramKey) {
     try {
       const resp = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en', {
         method: 'POST',
@@ -131,16 +108,56 @@ async function synthesizeHumanSpeech(text: string, voice: string = 'mulberry'): 
         const arrayBuf = await resp.arrayBuffer();
         const buffer = Buffer.from(arrayBuf);
         if (buffer.length > 200) {
-          console.log(`[Deepgram Aura] Synthesized ${buffer.length} bytes fallback speech`);
           return buffer;
         }
       }
     } catch (e: any) {
-      console.warn('[Deepgram Aura] Fallback error:', e.message);
+      console.warn('[Deepgram Aura] Error:', e.message);
     }
   }
 
-  // 3. Emergency offline fallback
+  // 2. Secondary: Rumik Silk Mulberry Studio Voice (24kHz WAV)
+  if (rumikKey) {
+    try {
+      const resp = await fetch(`${rumikUrl}/v1/tts`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${rumikKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ text, voice: 'mulberry' })
+      });
+      if (resp.ok) {
+        const arrayBuf = await resp.arrayBuffer();
+        const buffer = Buffer.from(arrayBuf);
+        if (buffer.length > 200) {
+          return buffer;
+        }
+      }
+    } catch (e: any) {
+      console.warn('[Rumik TTS] Error:', e.message);
+    }
+  }
+
+  // 3. Fallback to Deepgram Aura
+  if (deepgramKey && ttsProvider !== 'deepgram') {
+    try {
+      const resp = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Token ${deepgramKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ text })
+      });
+      if (resp.ok) {
+        const arrayBuf = await resp.arrayBuffer();
+        const buffer = Buffer.from(arrayBuf);
+        if (buffer.length > 200) return buffer;
+      }
+    } catch (e: any) {}
+  }
+
   return generateSyntheticSpeechPcm(1.5, 24000);
 }
 
@@ -388,7 +405,7 @@ async function main(): Promise<void> {
     };
 
     if (deepgramKey) {
-      const dgUrl = 'wss://api.deepgram.com/v1/listen?model=nova-3&language=en-IN&interim_results=true&smart_format=true&encoding=linear16&sample_rate=16000&vad_events=true&endpointing=350&utterance_end_ms=1000';
+      const dgUrl = 'wss://api.deepgram.com/v1/listen?model=nova-3&language=en-IN&interim_results=true&smart_format=true&encoding=linear16&sample_rate=16000&vad_events=true&endpointing=200&utterance_end_ms=500';
       deepgramWs = new WebSocket(dgUrl, {
         headers: {
           'Authorization': `Token ${deepgramKey}`
@@ -438,7 +455,7 @@ async function main(): Promise<void> {
                 if (turnDebounceTimer) clearTimeout(turnDebounceTimer);
                 turnDebounceTimer = setTimeout(() => {
                   triggerFinalTurn();
-                }, 750);
+                }, 300);
               }
             } else {
               const preview = (userTranscriptAccumulator ? userTranscriptAccumulator + ' ' : '') + transcript.trim();
@@ -524,19 +541,24 @@ async function main(): Promise<void> {
         sessionState.history.push({ role: 'assistant', content: replyText });
         sessionState.isSpeaking = true;
 
-        const ttsStart = Date.now();
-        const audioBuffer = await synthesizeHumanSpeech(replyText, 'mulberry');
-        const ttsLatencyMs = Date.now() - ttsStart;
+        // Split reply into sentence chunks for streaming audio delivery
+        const sentenceChunks = replyText.split(/(?<=[.?!।\n])\s+/).map(s => s.trim()).filter(Boolean);
+        const chunks = sentenceChunks.length > 0 ? sentenceChunks : [replyText];
 
         ws.send(JSON.stringify({
           type: 'agent_reply_start',
           text: replyText,
           ttftMs: ttftMs || 120,
-          ttsLatencyMs: ttsLatencyMs || 170,
-          voice: 'mulberry'
+          voice: process.env.TTS_PROVIDER || 'deepgram'
         }));
 
-        ws.send(audioBuffer);
+        for (const chunk of chunks) {
+          if (!sessionState.isSpeaking) break;
+          const chunkAudio = await synthesizeHumanSpeech(chunk);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(chunkAudio);
+          }
+        }
       }
     };
 

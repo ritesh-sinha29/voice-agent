@@ -152,37 +152,19 @@ def generate_synthetic_speech_pcm(duration_sec: float = 1.5, sample_rate: int = 
     header = generate_wav_header(len(samples), sample_rate)
     return header + bytes(samples)
 
-async def synthesize_human_speech(text: str, voice: str = "mulberry") -> bytes:
+async def synthesize_human_speech(text: str, voice: str = "asteria") -> bytes:
     """
-    Synthesize high-fidelity human speech:
-    Primary: Rumik Silk Mulberry (24kHz natural Indian-English WAV)
-    Fallback: Deepgram Aura Asteria (natural neural speech)
-    Last resort: Synthetic PCM waveform
+    Synthesize ultra-low latency high-fidelity human speech:
+    Primary: Deepgram Aura Asteria (neural speech, ~600ms sentence chunk latency)
+    Secondary: Rumik Silk Mulberry (studio voice fallback)
+    Emergency: Clean synthesized audio waveform
     """
-    # 1. Primary: Rumik Silk Mulberry Studio TTS
-    if RUMIK_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                resp = await client.post(
-                    f"{RUMIK_GATEWAY_URL}/v1/tts",
-                    headers={
-                        "Authorization": f"Bearer {RUMIK_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={"text": text, "voice": voice}
-                )
-                if resp.status_code == 200 and len(resp.content) > 200:
-                    logger.info("[Rumik TTS] Synthesized %d bytes of natural voice (%s)", len(resp.content), voice)
-                    return resp.content
-                else:
-                    logger.warning("[Rumik TTS] Gateway returned status %d: %s", resp.status_code, resp.text[:120])
-        except Exception as e:
-            logger.warning("[Rumik TTS] Connection error: %s", e)
+    tts_provider = os.getenv("TTS_PROVIDER", "deepgram").lower()
 
-    # 2. Secondary: Deepgram Aura Neural TTS Fallback
-    if DEEPGRAM_API_KEY:
+    # 1. Primary: Deepgram Aura Neural TTS (~600ms latency for streaming sentences)
+    if tts_provider == "deepgram" and DEEPGRAM_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=4.0) as client:
                 resp = await client.post(
                     "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
                     headers={
@@ -192,14 +174,48 @@ async def synthesize_human_speech(text: str, voice: str = "mulberry") -> bytes:
                     json={"text": text}
                 )
                 if resp.status_code == 200 and len(resp.content) > 200:
-                    logger.info("[Deepgram Aura] Synthesized %d bytes fallback speech", len(resp.content))
                     return resp.content
         except Exception as e:
-            logger.warning("[Deepgram Aura] Fallback error: %s", e)
+            logger.warning("[Deepgram Aura TTS] Connection error: %s", e)
 
-    # 3. Emergency offline fallback
-    logger.warning("[TTS Fallback] Using offline synthetic waveform.")
-    return generate_synthetic_speech_pcm(1.8, 24000)
+    # 2. Rumik Silk Mulberry Studio TTS
+    if RUMIK_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(
+                    f"{RUMIK_GATEWAY_URL}/v1/tts",
+                    headers={
+                        "Authorization": f"Bearer {RUMIK_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={"text": text, "voice": "mulberry"}
+                )
+                if resp.status_code == 200 and len(resp.content) > 200:
+                    logger.info("[Rumik TTS] Synthesized %d bytes of natural voice", len(resp.content))
+                    return resp.content
+                else:
+                    logger.warning("[Rumik TTS] Gateway returned status %d", resp.status_code)
+        except Exception as e:
+            logger.warning("[Rumik TTS] Connection error: %s", e)
+
+    # 3. Fallback to Deepgram Aura if not tried yet
+    if DEEPGRAM_API_KEY and tts_provider != "deepgram":
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                resp = await client.post(
+                    "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
+                    headers={
+                        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={"text": text}
+                )
+                if resp.status_code == 200 and len(resp.content) > 200:
+                    return resp.content
+        except Exception:
+            pass
+
+    return generate_synthetic_speech_pcm(1.5, 24000)
 
 # ------------------------------------------------------------------------------
 # Data Models with Validation
@@ -323,7 +339,7 @@ async def vobiz_inbound_webhook(request: Request):
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Response>\n'
         '    <Speak voice="WOMAN" language="en-IN">Namaste! Thank you for calling Replora. My name is Maya. How may I help you today?</Speak>\n'
-        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.5" executionTimeout="15" language="en-IN" />\n'
+        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="0.8" executionTimeout="15" language="en-IN" />\n'
         '    <Speak voice="WOMAN" language="en-IN">Thank you for calling Replora. Have a wonderful day. Goodbye!</Speak>\n'
         '</Response>'
     )
@@ -349,7 +365,7 @@ async def vobiz_inbound_turn(request: Request):
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<Response>\n'
             '    <Speak voice="WOMAN" language="en-IN">Sorry, I did not catch that. Could you please say that again?</Speak>\n'
-            f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.5" executionTimeout="15" language="en-IN" />\n'
+            f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="0.8" executionTimeout="15" language="en-IN" />\n'
             '    <Speak voice="WOMAN" language="en-IN">Thank you for calling Replora. Goodbye!</Speak>\n'
             '</Response>'
         )
@@ -399,7 +415,7 @@ async def vobiz_inbound_turn(request: Request):
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Response>\n'
         f'    <Speak voice="WOMAN" language="en-IN">{safe_reply}</Speak>\n'
-        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.5" executionTimeout="15" language="en-IN" />\n'
+        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="0.8" executionTimeout="15" language="en-IN" />\n'
         '    <Speak voice="WOMAN" language="en-IN">Thank you for speaking with Replora. Have a great day!</Speak>\n'
         '</Response>'
     )
@@ -562,8 +578,8 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
             "&encoding=linear16"
             "&sample_rate=16000"
             "&vad_events=true"
-            "&endpointing=350"
-            "&utterance_end_ms=1000"
+            "&endpointing=200"
+            "&utterance_end_ms=500"
         )
         try:
             headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
@@ -612,22 +628,28 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
         history.append({"role": "assistant", "content": reply_text})
         is_speaking = True
 
-        # Synthesize real studio voice (Rumik Silk Mulberry)
-        tts_start = time.time()
-        audio_data = await synthesize_human_speech(reply_text, voice="mulberry")
-        tts_latency_ms = int((time.time() - tts_start) * 1000) or 160
-
-        # Send start event with latency diagnostics
+        # Send start event immediately
         await safe_send_json({
             "type": "agent_reply_start",
             "text": reply_text,
             "ttftMs": ttft_ms,
-            "ttsLatencyMs": tts_latency_ms,
-            "voice": "mulberry"
+            "voice": os.getenv("TTS_PROVIDER", "deepgram")
         })
 
-        # Send synthesized real audio bytes
-        await safe_send_bytes(audio_data)
+        # Split reply into sentence chunks for streaming audio delivery
+        sentence_chunks = [s.strip() for s in re.split(r'(?<=[.?!।\n])\s+', reply_text) if s.strip()]
+        if not sentence_chunks:
+            sentence_chunks = [reply_text]
+
+        # Synthesize and stream chunk-by-chunk so caller hears speech in < 1 second!
+        for idx, chunk in enumerate(sentence_chunks):
+            if not is_speaking:
+                break
+            tts_start = time.time()
+            chunk_audio = await synthesize_human_speech(chunk)
+            chunk_ms = int((time.time() - tts_start) * 1000)
+            logger.info("[Audio Stream] Sent chunk %d/%d (%d chars, %d ms)", idx + 1, len(sentence_chunks), len(chunk), chunk_ms)
+            await safe_send_bytes(chunk_audio)
 
     async def deepgram_receiver():
         """Listen for transcription events from Deepgram Nova-3."""
@@ -681,12 +703,12 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                             await safe_send_json({"type": "transcript_final", "text": final_text})
                             active_turn_task = asyncio.create_task(handle_user_turn(final_text))
                         else:
-                            # 750ms safety silence debounce
+                            # 300ms fast silence debounce
                             if debounce_task and not debounce_task.done():
                                 debounce_task.cancel()
 
                             async def delayed_turn():
-                                await asyncio.sleep(0.75)
+                                await asyncio.sleep(0.3)
                                 nonlocal turn_accumulator, active_turn_task
                                 if turn_accumulator.strip():
                                     t = turn_accumulator.strip()
