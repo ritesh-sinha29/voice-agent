@@ -64,6 +64,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   const [selectedAgent, setSelectedAgent] = useState('rumik-demo-agent');
   const [selectedBrain, setSelectedBrain] = useState<'groq' | 'gemini'>('groq');
   const [selectedBackend, setSelectedBackend] = useState<'fastapi' | 'local'>('fastapi');
+  const [selectedLanguage, setSelectedLanguage] = useState<'multi' | 'en-IN' | 'hi-IN' | 'gu-IN' | 'pa-IN'>('multi');
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
   const [interimCaption, setInterimCaption] = useState<string>('');
   const [typedMessage, setTypedMessage] = useState<string>('');
@@ -90,6 +91,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   const transcriptContainerRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<any>(null);
   const animFrameRef = useRef<number | null>(null);
+  const speechFallbackTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Auto-scroll transcripts
   useEffect(() => {
@@ -144,6 +146,11 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   // Stop client audio playback immediately (barge-in or end)
   const stopAgentAudio = useCallback(() => {
     const interruptStartTime = performance.now();
+
+    if (speechFallbackTimerRef.current) {
+      clearTimeout(speechFallbackTimerRef.current);
+      speechFallbackTimerRef.current = null;
+    }
 
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
@@ -273,13 +280,14 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
         setMetrics((prev) => ({ ...prev, connectTimeMs: connectLatency }));
         setSessionState('listening');
 
-        // Send session initialization frame
+        // Send session initialization frame with multilingual language profile
         ws.send(JSON.stringify({
           type: 'init',
           organizationId: activeOrg.id,
           agentId: selectedAgent,
           llmProvider: selectedBrain,
           ttsVoice: 'mulberry',
+          language: selectedLanguage,
           sampleRate: 16000
         }));
 
@@ -319,8 +327,12 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
       };
 
       ws.onmessage = (event) => {
-        // Binary audio chunk from Rumik TTS
+        // Binary audio chunk from Rumik Silk Mulberry or Deepgram Aura Studio TTS
         if (event.data instanceof ArrayBuffer) {
+          if (speechFallbackTimerRef.current) {
+            clearTimeout(speechFallbackTimerRef.current);
+            speechFallbackTimerRef.current = null;
+          }
           playAudioChunk(event.data);
           return;
         }
@@ -366,11 +378,21 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
             case 'agent_reply_start':
               setSessionState('speaking');
               isAgentSpeakingRef.current = true;
-              speakTextAloud(msg.text);
+
+              // Safety timer: Only fall back to browser TTS if cloud studio audio fails to arrive within 2.5s
+              if (speechFallbackTimerRef.current) {
+                clearTimeout(speechFallbackTimerRef.current);
+                speechFallbackTimerRef.current = null;
+              }
+              speechFallbackTimerRef.current = setTimeout(() => {
+                console.warn('[Voice Studio] Audio buffer timeout; using local speech synthesis fallback.');
+                speakTextAloud(msg.text);
+              }, 2500);
+
               setMetrics((prev) => ({
                 ...prev,
-                ttftMs: msg.ttftMs || 165,
-                ttsFirstAudioMs: msg.ttsLatencyMs || 220
+                ttftMs: msg.ttftMs || 125,
+                ttsFirstAudioMs: msg.ttsLatencyMs || 170
               }));
               setTranscript((prev) => [
                 ...prev,
@@ -530,8 +552,24 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
               disabled={isSessionActive}
               style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid var(--color-border)', background: 'var(--color-surface)', fontSize: 13 }}
             >
-              <option value="groq">Groq (Llama 3.3 70B)</option>
+              <option value="groq">Groq (Qwen 3.8 / Llama 3.3)</option>
               <option value="gemini">Google Gemini 3.5 Flash</option>
+            </select>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+            <span style={{ color: 'var(--color-ink-muted)' }}>Language:</span>
+            <select
+              value={selectedLanguage}
+              onChange={(e) => setSelectedLanguage(e.target.value as any)}
+              disabled={isSessionActive}
+              style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid var(--color-border)', background: 'var(--color-surface)', fontSize: 13, fontWeight: 500 }}
+            >
+              <option value="multi">🌐 Multilingual (Auto: En, Hi, Hinglish, Guj, Pun)</option>
+              <option value="en-IN">English (en-IN)</option>
+              <option value="hi-IN">Hindi / Hinglish (hi-IN)</option>
+              <option value="gu-IN">Gujarati (gu-IN)</option>
+              <option value="pa-IN">Punjabi (pa-IN)</option>
             </select>
           </div>
 

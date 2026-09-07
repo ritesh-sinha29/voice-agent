@@ -29,14 +29,14 @@ export default function Agents({ activeOrg, currentUser }: AgentsProps) {
     id: 'agent_rumik_01',
     organizationId: activeOrg.id,
     name: 'Rumik ₹1 Demo Agent',
-    role: 'Warm Indian-English receptionist & lead qualifier',
-    language: 'multilingual (en-IN, hi-IN, Hinglish)',
+    role: 'Warm Indian receptionist & lead qualifier (Multilingual)',
+    language: 'multilingual (en-IN, hi-IN, Hinglish, gu-IN, pa-IN)',
     isPublished: true,
-    publishedVersion: 3,
+    publishedVersion: 4,
     sttProvider: 'deepgram',
     sttModel: 'nova-3-general',
     llmProvider: 'groq',
-    llmModel: 'llama-3.3-70b-versatile',
+    llmModel: 'qwen-3.8-27b / llama-3.3',
     ttsProvider: 'rumik',
     ttsVoice: 'mulberry',
     createdAt: '2026-09-01T10:00:00Z',
@@ -126,7 +126,7 @@ export default function Agents({ activeOrg, currentUser }: AgentsProps) {
             </span>
           </div>
           <p className="page-header-desc">
-            Production visual workflow with <strong>allow_interrupt=true</strong> on all speaking turns and multi-lingual Indian-English persona.
+            Production visual workflow with <strong>allow_interrupt=true</strong> on all speaking turns and multi-lingual persona (English, Hindi, Hinglish, Gujarati, Punjabi).
           </p>
         </div>
 
@@ -154,22 +154,31 @@ export default function Agents({ activeOrg, currentUser }: AgentsProps) {
 
       {/* Production Pipeline Specs */}
       <div className="card" style={{ padding: 'var(--space-6)', marginBottom: 'var(--space-8)' }}>
-        <h3 style={{ marginBottom: 12, fontSize: '1.15rem' }}>BYOK Production Pipeline Specification</h3>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+          <h3 style={{ fontSize: '1.15rem', margin: 0 }}>BYOK Production Pipeline Specification</h3>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            <span className="badge badge-accent">English (en-IN)</span>
+            <span className="badge badge-accent">Hindi (hi-IN)</span>
+            <span className="badge badge-accent">Hinglish</span>
+            <span className="badge badge-accent">Gujarati (gu-IN)</span>
+            <span className="badge badge-accent">Punjabi (pa-IN)</span>
+          </div>
+        </div>
         <div className="grid-4">
           <div>
             <div style={{ fontSize: 12, color: 'var(--color-ink-muted)', marginBottom: 4 }}>Speech-to-Text (STT)</div>
             <div style={{ fontWeight: 600 }}>Deepgram Nova-3</div>
-            <div style={{ fontSize: 12, color: 'var(--color-ink-muted)' }}>Multilingual (en-IN / hi-IN)</div>
+            <div style={{ fontSize: 12, color: 'var(--color-ink-muted)' }}>Multilingual (en, hi, gu, pa, Hinglish)</div>
           </div>
           <div>
             <div style={{ fontSize: 12, color: 'var(--color-ink-muted)', marginBottom: 4 }}>LLM Brain (Production)</div>
-            <div style={{ fontWeight: 600 }}>Groq Llama 3.3 70B</div>
-            <div style={{ fontSize: 12, color: 'var(--color-ink-muted)' }}>Gemini Flash Lite as fallback</div>
+            <div style={{ fontWeight: 600 }}>Groq Qwen 3.8 27B</div>
+            <div style={{ fontSize: 12, color: 'var(--color-ink-muted)' }}>Llama 3.3 / Gemini as fallback</div>
           </div>
           <div>
             <div style={{ fontSize: 12, color: 'var(--color-ink-muted)', marginBottom: 4 }}>Text-to-Speech (TTS)</div>
             <div style={{ fontWeight: 600 }}>Rumik Silk Mulberry</div>
-            <div style={{ fontSize: 12, color: 'var(--color-ink-muted)' }}>24 kHz streaming WAV</div>
+            <div style={{ fontSize: 12, color: 'var(--color-ink-muted)' }}>24 kHz Multilingual Indic WAV</div>
           </div>
           <div>
             <div style={{ fontSize: 12, color: 'var(--color-ink-muted)', marginBottom: 4 }}>Interruption Policy</div>
