@@ -1,0 +1,40 @@
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.cert
+
+# Logs & transcripts
+*.log
+logs/
+transcripts/
+recordings/
+call_lists/
+*.csv
+!examples/*.csv
+
+# Node & dependencies
+node_modules/
+dist/
+build/
+.npm
+.next/
+dashboard/.next/
+
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
