@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   PhoneCall, 
   Shield, 
@@ -12,7 +12,8 @@ import {
   Lock, 
   PhoneOutgoing, 
   HelpCircle,
-  Radio
+  Radio,
+  Settings
 } from 'lucide-react';
 import { Organization, VoBizConfig, VoiceLinkConfig, User } from '../types';
 
@@ -28,7 +29,14 @@ export default function Telephony({ activeOrg, currentUser }: TelephonyProps) {
   const [outboundModalOpen, setOutboundModalOpen] = useState(false);
   const [outboundStatus, setOutboundStatus] = useState<string | null>(null);
 
-  // Masked configurations (Secrets never printed or exposed)
+  // Carrier credentials configuration modal states
+  const [configModalOpen, setConfigModalOpen] = useState(false);
+  const [authIdInput, setAuthIdInput] = useState('');
+  const [authTokenInput, setAuthTokenInput] = useState('');
+  const [carrierNumberInput, setCarrierNumberInput] = useState('');
+  const [saveStatus, setSaveStatus] = useState<string | null>(null);
+
+  // Masked configurations (Reflects live .env carrier setup)
   const [vobizConfig, setVoBizConfig] = useState<VoBizConfig>({
     authId: 'VB_AUTH_••••••••9482',
     authToken: '••••••••••••••••••••••••3821',
@@ -36,9 +44,24 @@ export default function Telephony({ activeOrg, currentUser }: TelephonyProps) {
     applicationId: 'app_dograh_vobiz_prod_01',
     answerUrl: 'https://backend.voice.rumik.ai/api/v1/telephony/inbound/run',
     method: 'POST',
-    status: 'connected',
+    status: 'mock_connected',
     lastVerifiedAt: 'Just now'
   });
+
+  useEffect(() => {
+    fetch('/api/telephony/status')
+      .then(res => res.json())
+      .then(data => {
+        if (data && data.vobiz) {
+          setVoBizConfig(prev => ({
+            ...prev,
+            number: data.vobiz.number || prev.number,
+            status: data.vobiz.status === 'configured' ? 'connected' : 'mock_connected'
+          }));
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const [voicelinkConfig, setVoiceLinkConfig] = useState<VoiceLinkConfig>({
     resellerUser: 'VL_RESELLER_••••••••1102',
@@ -72,7 +95,7 @@ export default function Telephony({ activeOrg, currentUser }: TelephonyProps) {
     }, 1200);
   };
 
-  const handlePlaceTestCall = (e: React.FormEvent) => {
+  const handlePlaceTestCall = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!testNumber) return;
 
@@ -81,16 +104,68 @@ export default function Telephony({ activeOrg, currentUser }: TelephonyProps) {
       return;
     }
 
-    // Explicit confirmation guard per operating rule 4
+    // Confirmation guard
     const confirmed = window.confirm(
-      `SAFETY CONFIRMATION:\n\nTarget Number: ${testNumber}\nEstimated Scope: 1 call turn (~1 min)\nProvider: VoBiz Primary PSTN\n\nConfirm initiating paid carrier test call?`
+      `OUTBOUND CALL CONFIRMATION:\n\nTarget Number: ${testNumber}\nProvider: VoBiz Primary PSTN (+91)\n\nProceed with initiating this outbound phone call?`
     );
 
     if (confirmed) {
-      setOutboundStatus('Initiating call through Dograh orchestrator to ' + testNumber + '...');
-      setTimeout(() => {
-        setOutboundStatus('Call dispatched. Application ID: ' + vobizConfig.applicationId + ' | Session initiated.');
-      }, 1500);
+      setOutboundStatus('Connecting to Carrier Dispatch API for ' + testNumber + '...');
+      try {
+        const resp = await fetch('/api/telephony/outbound', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target_number: testNumber })
+        });
+        const data = await resp.json();
+
+        if (data.status === 'mock_initiated') {
+          setOutboundStatus(
+            '⚠️ Simulated Call (Carrier Credentials Needed): ' +
+            'The call was dispatched in local mock mode because VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN, and VOBIZ_NUMBER are not set in .env. ' +
+            'To make physical phones ring at ' + testNumber + ', enter your live carrier credentials in .env.'
+          );
+        } else if (resp.ok) {
+          setOutboundStatus('✅ Real Call Dispatched via VoBiz PSTN! Ringing ' + testNumber + '... (Session ID: ' + (data.id || data.call_id || 'vobiz-live-session') + ')');
+        } else {
+          setOutboundStatus('❌ Dispatch Error: ' + (data.detail || data.error || 'Failed to connect to carrier gateway.'));
+        }
+      } catch (err: any) {
+        setOutboundStatus('❌ Network error connecting to telephony gateway: ' + err.message);
+      }
+    }
+  };
+
+  const handleSaveCarrierConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaveStatus('Saving carrier configuration...');
+    try {
+      const resp = await fetch('/api/telephony/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          authId: authIdInput.trim(),
+          authToken: authTokenInput.trim(),
+          number: carrierNumberInput.trim()
+        })
+      });
+      if (resp.ok) {
+        setSaveStatus('✅ Credentials saved to .env! Updating carrier status...');
+        setVoBizConfig((prev) => ({
+          ...prev,
+          authId: authIdInput ? `VB_AUTH_••••${authIdInput.slice(-4)}` : prev.authId,
+          number: carrierNumberInput || prev.number,
+          status: authIdInput && authTokenInput ? 'connected' : 'mock_connected'
+        }));
+        setTimeout(() => {
+          setConfigModalOpen(false);
+          setSaveStatus(null);
+        }, 1200);
+      } else {
+        setSaveStatus('❌ Failed to save configuration.');
+      }
+    } catch (err: any) {
+      setSaveStatus('❌ Error: ' + err.message);
     }
   };
 
@@ -104,12 +179,20 @@ export default function Telephony({ activeOrg, currentUser }: TelephonyProps) {
           </p>
         </div>
 
-        <button 
-          className="btn-primary"
-          onClick={() => setOutboundModalOpen(true)}
-        >
-          <PhoneOutgoing size={16} /> Verified Outbound Test
-        </button>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button 
+            className="btn-secondary"
+            onClick={() => setConfigModalOpen(true)}
+          >
+            <Settings size={15} /> Configure Carrier Keys
+          </button>
+          <button 
+            className="btn-primary"
+            onClick={() => setOutboundModalOpen(true)}
+          >
+            <PhoneOutgoing size={15} /> Verified Outbound Test
+          </button>
+        </div>
       </div>
 
       {/* Grid: VoBiz and VoiceLink Cards */}
@@ -125,9 +208,15 @@ export default function Telephony({ activeOrg, currentUser }: TelephonyProps) {
               <p style={{ fontSize: 13 }}>Dedicated PSTN routing via VoBiz application webhooks</p>
             </div>
 
-            <span className="badge badge-success">
-              <CheckCircle size={12} /> Connected
-            </span>
+            {vobizConfig.status === 'connected' ? (
+              <span className="badge badge-success">
+                <CheckCircle size={12} /> Live PSTN Active
+              </span>
+            ) : (
+              <span className="badge badge-warning" title="Supply VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN in .env for physical phone line dialing">
+                <AlertTriangle size={12} /> Simulation / Mock Mode
+              </span>
+            )}
           </div>
 
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 12, margin: '12px 0' }}>
@@ -265,10 +354,29 @@ export default function Telephony({ activeOrg, currentUser }: TelephonyProps) {
           zIndex: 1000
         }}>
           <div className="card" style={{ maxWidth: 500, width: '90%', padding: 'var(--space-6)' }}>
-            <h3 style={{ marginBottom: 8 }}>Initiate Paid Carrier Test Call</h3>
-            <p style={{ fontSize: 13, marginBottom: 16 }}>
-              Place a single test call using the VoBiz outbound caller ID <strong>{vobizConfig.number}</strong>.
+            <h3 style={{ marginBottom: 8 }}>Initiate Carrier Test Call</h3>
+            <p style={{ fontSize: 13, marginBottom: 14 }}>
+              Dispatch an outbound voice call turn to any Indian or international phone number.
             </p>
+
+            {vobizConfig.status !== 'connected' && (
+              <div style={{
+                padding: '10px 14px',
+                backgroundColor: 'var(--color-surface-muted)',
+                borderRadius: 'var(--radius-control)',
+                border: '1px solid var(--color-border)',
+                marginBottom: 16,
+                fontSize: 12
+              }}>
+                <div style={{ fontWeight: 600, color: 'var(--color-ink)', marginBottom: 2, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <AlertTriangle size={13} color="var(--color-warning)" />
+                  Local Simulation Mode (PSTN Carrier Inactive)
+                </div>
+                <div style={{ color: 'var(--color-ink-muted)', lineHeight: 1.4 }}>
+                  Physical phones will not ring until <code>VOBIZ_AUTH_ID</code> & <code>VOBIZ_AUTH_TOKEN</code> are added to <code>.env</code>. To test live two-way voice with Maya right now, use the <strong>Talk to It</strong> tab.
+                </div>
+              </div>
+            )}
 
             <form onSubmit={handlePlaceTestCall}>
               <label style={{ display: 'block', fontSize: 12, fontWeight: 600, marginBottom: 6, color: 'var(--color-ink-muted)' }}>
@@ -306,6 +414,110 @@ export default function Telephony({ activeOrg, currentUser }: TelephonyProps) {
                 </button>
                 <button type="submit" className="btn-primary">
                   <PhoneOutgoing size={15} /> Confirm & Call
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Carrier Configuration Modal */}
+      {configModalOpen && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(32, 26, 23, 0.4)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000
+        }}>
+          <div className="card" style={{ maxWidth: 520, width: '90%', padding: 'var(--space-6)' }}>
+            <h3 style={{ marginBottom: 8 }}>Connect PSTN Carrier Credentials</h3>
+            <p style={{ fontSize: 13, color: 'var(--color-ink-muted)', marginBottom: 16 }}>
+              Configure your live VoBiz or telecom trunk credentials to enable outbound dialing to physical cellular lines.
+            </p>
+
+            <form onSubmit={handleSaveCarrierConfig}>
+              <div style={{ marginBottom: 14 }}>
+                <label style={{ display: 'block', fontSize: 12, fontWeight: 600, marginBottom: 4, color: 'var(--color-ink)' }}>
+                  VoBiz Auth ID (API Key):
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. VB_AUTH_live_984210"
+                  value={authIdInput}
+                  onChange={(e) => setAuthIdInput(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '9px 12px',
+                    borderRadius: 'var(--radius-control)',
+                    border: '1px solid var(--color-border)',
+                    fontSize: 13
+                  }}
+                  required
+                />
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <label style={{ display: 'block', fontSize: 12, fontWeight: 600, marginBottom: 4, color: 'var(--color-ink)' }}>
+                  VoBiz Auth Token (Secret Key):
+                </label>
+                <input
+                  type="password"
+                  placeholder="e.g. vb_sec_live_9837192"
+                  value={authTokenInput}
+                  onChange={(e) => setAuthTokenInput(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '9px 12px',
+                    borderRadius: 'var(--radius-control)',
+                    border: '1px solid var(--color-border)',
+                    fontSize: 13
+                  }}
+                  required
+                />
+              </div>
+
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: 'block', fontSize: 12, fontWeight: 600, marginBottom: 4, color: 'var(--color-ink)' }}>
+                  Purchased Virtual Number (E.164 Caller ID):
+                </label>
+                <input
+                  type="text"
+                  placeholder="+919876543210"
+                  value={carrierNumberInput}
+                  onChange={(e) => setCarrierNumberInput(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '9px 12px',
+                    borderRadius: 'var(--radius-control)',
+                    border: '1px solid var(--color-border)',
+                    fontSize: 13
+                  }}
+                  required
+                />
+              </div>
+
+              {saveStatus && (
+                <div style={{ padding: '10px', background: 'var(--color-surface-muted)', borderRadius: 8, fontSize: 12, marginBottom: 16 }}>
+                  {saveStatus}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
+                <button 
+                  type="button" 
+                  className="btn-secondary" 
+                  onClick={() => { setConfigModalOpen(false); setSaveStatus(null); }}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="btn-primary">
+                  <Lock size={14} /> Save & Connect
                 </button>
               </div>
             </form>

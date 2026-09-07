@@ -245,6 +245,69 @@ async function main(): Promise<void> {
       return;
     }
 
+    // Multi-tenant Telephony Outbound Call Dispatch API
+    if (parsedUrl.pathname === '/api/telephony/outbound' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const payload = JSON.parse(body || '{}');
+          const targetNumber = payload.target_number || payload.targetNumber;
+
+          // Forward to FastAPI voice agent service
+          const resp = await fetch('http://localhost:8000/api/v1/telephony/outbound', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target_number: targetNumber })
+          });
+          const data = await resp.json();
+          res.writeHead(resp.status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(data));
+        } catch (e: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+
+    // Save Carrier Configuration to .env
+    if (parsedUrl.pathname === '/api/telephony/config' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const payload = JSON.parse(body || '{}');
+          const { authId, authToken, number } = payload;
+
+          if (authId) process.env.VOBIZ_AUTH_ID = authId;
+          if (authToken) process.env.VOBIZ_AUTH_TOKEN = authToken;
+          if (number) process.env.VOBIZ_NUMBER = number;
+
+          if (fs.existsSync(envPath)) {
+            let envContent = fs.readFileSync(envPath, 'utf8');
+            if (authId) {
+              envContent = envContent.replace(/^VOBIZ_AUTH_ID=.*$/m, `VOBIZ_AUTH_ID=${authId}`);
+            }
+            if (authToken) {
+              envContent = envContent.replace(/^VOBIZ_AUTH_TOKEN=.*$/m, `VOBIZ_AUTH_TOKEN=${authToken}`);
+            }
+            if (number) {
+              envContent = envContent.replace(/^VOBIZ_NUMBER=.*$/m, `VOBIZ_NUMBER=${number}`);
+            }
+            fs.writeFileSync(envPath, envContent, 'utf8');
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'ok', message: 'Carrier configuration saved successfully.' }));
+        } catch (e: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+
     // Multi-tenant Audit API
     if (parsedUrl.pathname === '/api/audit') {
       res.writeHead(200, { 'Content-Type': 'application/json' });

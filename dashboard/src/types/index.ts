@@ -36,7 +36,7 @@ export interface VoBizConfig {
   applicationId: string;
   answerUrl: string;
   method: 'POST';
-  status: 'connected' | 'degraded' | 'blocked' | 'empty';
+  status: 'connected' | 'mock_connected' | 'degraded' | 'blocked' | 'empty';
   lastVerifiedAt?: string;
 }
 
