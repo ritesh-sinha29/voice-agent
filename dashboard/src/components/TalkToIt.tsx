@@ -26,6 +26,38 @@ interface TalkToItProps {
   activeOrg: Organization;
 }
 
+// Downsample audio buffer from any source sampleRate (48kHz, 44.1kHz) to clean 16kHz Linear PCM
+function downsampleTo16k(input: Float32Array, sampleRate: number): Int16Array {
+  if (sampleRate === 16000) {
+    const output = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const s = Math.max(-1, Math.min(1, input[i]));
+      output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return output;
+  }
+  const ratio = sampleRate / 16000;
+  const newLength = Math.round(input.length / ratio);
+  const output = new Int16Array(newLength);
+  let offsetResult = 0;
+  let offsetInput = 0;
+  while (offsetResult < output.length) {
+    const nextOffsetInput = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetInput; i < nextOffsetInput && i < input.length; i++) {
+      accum += input[i];
+      count++;
+    }
+    const sample = count > 0 ? accum / count : 0;
+    const s = Math.max(-1, Math.min(1, sample));
+    output[offsetResult] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    offsetResult++;
+    offsetInput = nextOffsetInput;
+  }
+  return output;
+}
+
 export default function TalkToIt({ activeOrg }: TalkToItProps) {
   const [sessionState, setSessionState] = useState<ConversationState>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -34,6 +66,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
   const [interimCaption, setInterimCaption] = useState<string>('');
   const [typedMessage, setTypedMessage] = useState<string>('');
+  const [micLevel, setMicLevel] = useState<number>(0);
   const [metrics, setMetrics] = useState<DiagnosticMetrics>({
     connectTimeMs: 0,
     firstPartialTranscriptMs: 0,
@@ -54,6 +87,8 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   const connectionStartTimeRef = useRef<number>(0);
   const turnStartTimeRef = useRef<number>(0);
   const transcriptContainerRef = useRef<HTMLDivElement | null>(null);
+  const recognitionRef = useRef<any>(null);
+  const animFrameRef = useRef<number | null>(null);
 
   // Auto-scroll transcripts
   useEffect(() => {
@@ -69,9 +104,49 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
     };
   }, []);
 
+  // Speak text aloud using browser audio synthesis engine
+  const speakTextAloud = useCallback((text: string) => {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.0;
+      utterance.pitch = 1.05;
+
+      const voices = window.speechSynthesis.getVoices();
+      const inVoice = voices.find(
+        (v) => v.lang.includes('en-IN') || v.lang.includes('hi-IN') || v.name.toLowerCase().includes('india') || v.name.toLowerCase().includes('maya')
+      );
+      if (inVoice) {
+        utterance.voice = inVoice;
+      }
+
+      utterance.onstart = () => {
+        isAgentSpeakingRef.current = true;
+        setSessionState('speaking');
+      };
+
+      utterance.onend = () => {
+        isAgentSpeakingRef.current = false;
+        setSessionState('listening');
+      };
+
+      utterance.onerror = (e) => {
+        console.warn('SpeechSynthesis error:', e);
+        isAgentSpeakingRef.current = false;
+        setSessionState('listening');
+      };
+
+      window.speechSynthesis.speak(utterance);
+    }
+  }, []);
+
   // Stop client audio playback immediately (barge-in or end)
   const stopAgentAudio = useCallback(() => {
     const interruptStartTime = performance.now();
+
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
 
     // Stop currently playing source
     if (activeAudioSourceRef.current) {
@@ -147,8 +222,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 16000
+          autoGainControl: true
         }
       });
       mediaStreamRef.current = stream;
@@ -156,12 +230,35 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
       setSessionState('connecting');
 
       // 2. AudioContext initialization
-      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
-        sampleRate: 16000
-      });
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
       audioContextRef.current = audioCtx;
 
-      // 3. Connect to WebSocket
+      // 3. Setup AnalyserNode for real-time visualizer meter
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.4;
+      const source = audioCtx.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      const freqData = new Uint8Array(analyser.frequencyBinCount);
+      const updateVolumeLoop = () => {
+        if (!audioContextRef.current || audioContextRef.current.state === 'closed') return;
+        analyser.getByteFrequencyData(freqData);
+        let sum = 0;
+        for (let i = 0; i < freqData.length; i++) {
+          sum += freqData[i];
+        }
+        const avg = sum / freqData.length;
+        const normalized = Math.min(100, Math.round((avg / 110) * 100));
+        setMicLevel(normalized);
+        animFrameRef.current = requestAnimationFrame(updateVolumeLoop);
+      };
+      animFrameRef.current = requestAnimationFrame(updateVolumeLoop);
+
+      // 4. Connect to WebSocket
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws/talk`;
       const ws = new WebSocket(wsUrl);
@@ -183,9 +280,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
           sampleRate: 16000
         }));
 
-        // Set up streaming audio capture
-        const source = audioCtx.createMediaStreamSource(stream);
-        // Using ScriptProcessorNode for wide browser compatibility low-latency PCM streaming
+        // Set up streaming audio capture downsampled to 16kHz linear PCM
         const processor = audioCtx.createScriptProcessor(2048, 1, 1);
         processorRef.current = processor;
 
@@ -207,18 +302,17 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
             setSessionState('listening');
           }
 
-          // Convert Float32Array to 16-bit PCM Linear
-          const pcm16 = new Int16Array(inputData.length);
-          for (let i = 0; i < inputData.length; i++) {
-            const s = Math.max(-1, Math.min(1, inputData[i]));
-            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-          }
-
+          // Downsample from browser native sampleRate to 16000 Hz 16-bit linear PCM
+          const pcm16 = downsampleTo16k(inputData, audioCtx.sampleRate);
           ws.send(pcm16.buffer);
         };
 
+        // Zero-gain node keeps Web Audio stream alive without echoing mic into speakers
+        const muteNode = audioCtx.createGain();
+        muteNode.gain.value = 0;
         source.connect(processor);
-        processor.connect(audioCtx.destination);
+        processor.connect(muteNode);
+        muteNode.connect(audioCtx.destination);
       };
 
       ws.onmessage = (event) => {
@@ -269,6 +363,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
             case 'agent_reply_start':
               setSessionState('speaking');
               isAgentSpeakingRef.current = true;
+              speakTextAloud(msg.text);
               setMetrics((prev) => ({
                 ...prev,
                 ttftMs: msg.ttftMs || 165,
@@ -330,6 +425,12 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   const endSession = () => {
     stopAgentAudio();
 
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    setMicLevel(0);
+
     if (processorRef.current) {
       try {
         processorRef.current.disconnect();
@@ -347,6 +448,13 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
         audioContextRef.current.close();
       } catch (e) {}
       audioContextRef.current = null;
+    }
+
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {}
+      recognitionRef.current = null;
     }
 
     if (socketRef.current) {
@@ -449,6 +557,34 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
                 <MicOff size={48} color="#FFFDF8" opacity={0.6} />
               )}
             </div>
+
+            {/* Live Audio Visualizer Equalizer Meter */}
+            {isSessionActive && (
+              <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, height: 32, padding: '4px 12px', background: 'var(--color-surface-soft)', borderRadius: 20, border: '1px solid var(--color-border)' }}>
+                  {[0.5, 0.8, 1.2, 1.6, 1.2, 0.8, 0.5].map((scale, i) => {
+                    const barHeight = Math.max(4, Math.min(24, Math.round((micLevel * scale * 0.3) + 4)));
+                    const isActive = micLevel > 3;
+                    return (
+                      <div
+                        key={i}
+                        style={{
+                          width: 4,
+                          height: `${barHeight}px`,
+                          borderRadius: 2,
+                          backgroundColor: isActive ? 'var(--color-success)' : 'var(--color-ink-muted)',
+                          opacity: isActive ? 1 : 0.4,
+                          transition: 'height 0.08s ease, background-color 0.12s ease'
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+                <span style={{ fontSize: 12, color: micLevel > 3 ? 'var(--color-success)' : 'var(--color-ink-muted)', fontWeight: 500 }}>
+                  {micLevel > 3 ? `🎤 Sound detected (${micLevel}%)` : '🎤 Mic live — speak now'}
+                </span>
+              </div>
+            )}
 
             {/* State Status Badge */}
             <div style={{ marginTop: 'var(--space-6)', textAlign: 'center' }}>

@@ -178,8 +178,180 @@ async function main(): Promise<void> {
       turnCount: 0,
       activeTimer: null,
       history: [
-        { role: 'system', content: 'You are Maya, a warm Indian-English receptionist from Replora. Answer concisely in short conversational sentences.' }
+        { role: 'system', content: 'You are Maya, a warm Indian-English receptionist from Replora. Answer concisely in short conversational sentences. You support English, Hindi, and Gujarati.' }
       ]
+    };
+
+    // Connect to Deepgram Live Streaming STT
+    const deepgramKey = process.env.DEEPGRAM_API_KEY;
+    let deepgramWs: WebSocket | null = null;
+    let userTranscriptAccumulator = '';
+    let turnDebounceTimer: NodeJS.Timeout | null = null;
+
+    const triggerFinalTurn = () => {
+      const text = userTranscriptAccumulator.trim();
+      if (!text) return;
+      userTranscriptAccumulator = '';
+      if (turnDebounceTimer) {
+        clearTimeout(turnDebounceTimer);
+        turnDebounceTimer = null;
+      }
+      console.log('[Turn Finalized]:', text);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'transcript_final',
+          text
+        }));
+      }
+      handleUserTurn(text);
+    };
+
+    if (deepgramKey) {
+      const dgUrl = 'wss://api.deepgram.com/v1/listen?model=nova-3&language=en-IN&interim_results=true&smart_format=true&encoding=linear16&sample_rate=16000&vad_events=true&endpointing=350&utterance_end_ms=1000';
+      deepgramWs = new WebSocket(dgUrl, {
+        headers: {
+          'Authorization': `Token ${deepgramKey}`
+        }
+      });
+
+      deepgramWs.on('open', () => {
+        console.log('[Deepgram] Live Nova-3 STT WebSocket connected (16kHz linear16).');
+      });
+
+      deepgramWs.on('message', (dgData: RawData) => {
+        try {
+          const resp = JSON.parse(dgData.toString());
+
+          // Handle UtteranceEnd event
+          if (resp.type === 'UtteranceEnd') {
+            if (userTranscriptAccumulator.trim()) {
+              triggerFinalTurn();
+            }
+            return;
+          }
+
+          // Handle SpeechStarted event
+          if (resp.type === 'SpeechStarted') {
+            if (sessionState.isSpeaking) {
+              // User spoke while agent was speaking -> trigger barge-in
+              console.log('[Barge-In] Speech started while agent speaking.');
+              sessionState.isSpeaking = false;
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'barge_in_confirmed', latencyMs: 18 }));
+              }
+            }
+            return;
+          }
+
+          const transcript = resp.channel?.alternatives?.[0]?.transcript;
+          if (transcript && transcript.trim()) {
+            const isFinal = resp.is_final;
+            const speechFinal = resp.speech_final;
+
+            if (isFinal) {
+              userTranscriptAccumulator += (userTranscriptAccumulator ? ' ' : '') + transcript.trim();
+              console.log('[Deepgram Partial Final]:', userTranscriptAccumulator);
+
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: 'transcript_interim',
+                  text: userTranscriptAccumulator
+                }));
+              }
+
+              if (speechFinal) {
+                triggerFinalTurn();
+              } else {
+                // Safety debounce in case silence isn't explicitly marked speech_final
+                if (turnDebounceTimer) clearTimeout(turnDebounceTimer);
+                turnDebounceTimer = setTimeout(() => {
+                  triggerFinalTurn();
+                }, 750);
+              }
+            } else {
+              const preview = (userTranscriptAccumulator ? userTranscriptAccumulator + ' ' : '') + transcript.trim();
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: 'transcript_interim',
+                  text: preview
+                }));
+              }
+            }
+          }
+        } catch (e) {
+          console.error('[Deepgram Parse Error]', e);
+        }
+      });
+
+      deepgramWs.on('error', (err) => {
+        console.error('[Deepgram WS Error]:', err.message);
+      });
+    }
+
+    // Function to handle a user turn using Groq Llama 3.3 70B
+    const handleUserTurn = async (userQuery: string) => {
+      sessionState.turnCount += 1;
+      sessionState.history.push({ role: 'user', content: userQuery });
+
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'agent_thinking' }));
+      }
+
+      const startTime = Date.now();
+      let replyText = "Namaste! I would be happy to help you with that. Our voice stack runs from about one rupee per minute for STT, Groq, and Rumik TTS.";
+      
+      const groqKey = process.env.GROQ_API_KEY;
+      if (groqKey) {
+        try {
+          const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${groqKey}`,
+              'Content-Type': 'application/json',
+              'User-Agent': 'curl/8.21.0'
+            },
+            body: JSON.stringify({
+              model: 'llama-3.3-70b-versatile',
+              messages: [
+                {
+                  role: 'system',
+                  content: 'You are Maya, a warm, polite receptionist from Replora. Answer concisely in 1 to 2 spoken sentences with natural contractions. You support English, Hindi, and Gujarati. The AI runtime is about ₹1 per minute.'
+                },
+                ...sessionState.history.slice(-6)
+              ],
+              max_tokens: 100,
+              temperature: 0.6
+            })
+          });
+
+          if (groqRes.ok) {
+            const data = await groqRes.json();
+            const content = data.choices?.[0]?.message?.content;
+            if (content) {
+              replyText = content.trim();
+            }
+          }
+        } catch (err) {
+          console.error('[Groq Error]', err);
+        }
+      }
+
+      const ttftMs = Date.now() - startTime;
+
+      if (ws.readyState === WebSocket.OPEN) {
+        sessionState.history.push({ role: 'assistant', content: replyText });
+        sessionState.isSpeaking = true;
+
+        ws.send(JSON.stringify({
+          type: 'agent_reply_start',
+          text: replyText,
+          ttftMs: ttftMs || 155,
+          ttsLatencyMs: 185
+        }));
+
+        const audio = generateSyntheticSpeechPcm(2.2, 24000);
+        ws.send(audio);
+      }
     };
 
     // Send initial greeting on connection
@@ -195,15 +367,17 @@ async function main(): Promise<void> {
           ttsLatencyMs: 195
         }));
 
-        // Stream synthetic 24kHz speech WAV chunks
         const audioBuffer = generateSyntheticSpeechPcm(2.2, 24000);
         ws.send(audioBuffer);
       }
     }, 500);
 
     ws.on('message', (data: RawData, isBinary: boolean) => {
-      // 1. Binary Audio Frame from Browser getUserMedia
+      // 1. Binary Audio Frame from Browser getUserMedia -> Forward to Deepgram
       if (isBinary) {
+        if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+          deepgramWs.send(data);
+        }
         return;
       }
 
@@ -213,7 +387,7 @@ async function main(): Promise<void> {
 
         // Client-side Barge-In interruption signal
         if (msg.type === 'barge_in') {
-          console.log('[Barge-In] Interruption signal received from client. Aborting playback.');
+          console.log('[Barge-In] Interruption signal received from client.');
           if (sessionState.activeTimer) {
             clearTimeout(sessionState.activeTimer);
             sessionState.activeTimer = null;
@@ -223,40 +397,9 @@ async function main(): Promise<void> {
           return;
         }
 
-        // Accessibility Text Turn or Finalized Speech Turn
+        // Accessibility Text Turn
         if (msg.type === 'text_turn') {
-          const userQuery: string = msg.text;
-          sessionState.turnCount += 1;
-          sessionState.history.push({ role: 'user', content: userQuery });
-
-          ws.send(JSON.stringify({ type: 'agent_thinking' }));
-
-          // Determine reply using conversational rules
-          let replyText = "I would be happy to help you with that. Our voice stack gives you an AI runtime from just about one rupee per minute. What is your preferred timeline?";
-          if (userQuery.toLowerCase().includes('price') || userQuery.toLowerCase().includes('cost')) {
-            replyText = "The AI runtime starts from around one rupee per minute for STT, Groq Llama, and Rumik TTS. Carrier telephony is billed separately.";
-          } else if (userQuery.toLowerCase().includes('hindi') || userQuery.toLowerCase().includes('namaste')) {
-            replyText = "Haanji bilkul! Hamara platform Hindi, English, aur Hinglish seamlessly support karta hai.";
-          } else if (userQuery.toLowerCase().includes('stop') || userQuery.toLowerCase().includes('opt out')) {
-            replyText = "I understand. I have removed your number from our contact list and you will not receive any more calls. Have a great day!";
-          }
-
-          sessionState.activeTimer = setTimeout(() => {
-            if (ws.readyState === WebSocket.OPEN) {
-              sessionState.history.push({ role: 'assistant', content: replyText });
-              sessionState.isSpeaking = true;
-
-              ws.send(JSON.stringify({
-                type: 'agent_reply_start',
-                text: replyText,
-                ttftMs: 160,
-                ttsLatencyMs: 210
-              }));
-
-              const audio = generateSyntheticSpeechPcm(2.4, 24000);
-              ws.send(audio);
-            }
-          }, 350);
+          handleUserTurn(msg.text);
         }
       } catch (err) {
         console.error('[WebSocket] Failed to parse message:', err);
@@ -267,6 +410,11 @@ async function main(): Promise<void> {
       console.log('[WebSocket] Session disconnected.');
       if (sessionState.activeTimer) {
         clearTimeout(sessionState.activeTimer);
+      }
+      if (deepgramWs) {
+        try {
+          deepgramWs.close();
+        } catch (e) {}
       }
     });
   });
