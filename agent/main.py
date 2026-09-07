@@ -273,15 +273,140 @@ async def smoke_test_brain():
         "ttftTargetMs": 140
     }
 
-@app.post("/api/v1/telephony/inbound/run")
-async def vobiz_inbound_webhook(payload: Optional[Dict] = None):
-    """VoBiz Inbound PSTN webhook endpoint."""
-    logger.info("VoBiz inbound call initiated: %s", payload)
-    return {
-        "action": "answer",
-        "stream_url": f"wss://{os.getenv('PUBLIC_DOMAIN', 'localhost:8000')}/ws/talk",
-        "greeting": "Namaste! Thank you for calling Replora. My name is Maya. How may I help you today?"
-    }
+# ------------------------------------------------------------------------------
+# 2-Way Telephony Conversation Engine (VoBiz / Plivo PSTN)
+# ------------------------------------------------------------------------------
+phone_call_histories: Dict[str, List[Dict[str, str]]] = {}
+
+@app.api_route("/api/v1/telephony/inbound/run", methods=["GET", "POST"])
+async def vobiz_inbound_webhook(request: Request):
+    """VoBiz / Plivo Inbound & Initial Call Answer Webhook."""
+    accept = request.headers.get("accept", "")
+    content_type = request.headers.get("content-type", "")
+    
+    carrier_data = {}
+    try:
+        if "application/json" in content_type:
+            carrier_data = await request.json()
+        else:
+            carrier_data = dict(await request.form())
+    except Exception:
+        pass
+
+    call_uuid = carrier_data.get("CallUUID", "call_session")
+    phone_call_histories[call_uuid] = []
+    logger.info("VoBiz call answered: CallUUID=%s, From=%s, To=%s", call_uuid, carrier_data.get("From"), carrier_data.get("To"))
+
+    # Return JSON only if client is internal health check
+    if "application/json" in accept and not carrier_data.get("CallUUID"):
+        return {
+            "action": "answer",
+            "stream_url": f"wss://{os.getenv('PUBLIC_DOMAIN', 'localhost:8000')}/ws/talk",
+            "greeting": "Namaste! Thank you for calling Replora. My name is Maya. How may I help you today?"
+        }
+
+    public_domain = os.getenv("PUBLIC_DOMAIN", "waterlogged-marianela-overhonestly.ngrok-free.dev")
+    turn_url = f"https://{public_domain}/api/v1/telephony/inbound/turn"
+
+    # Start interactive 2-way speech conversation
+    xml_content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Response>\n'
+        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.2" executionTimeout="15" language="en-IN">\n'
+        '        <Speak voice="WOMAN" language="en-IN">Namaste! Thank you for calling Replora. My name is Maya. How may I help you today?</Speak>\n'
+        '    </GetInput>\n'
+        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.2" executionTimeout="12" language="en-IN">\n'
+        '        <Speak voice="WOMAN" language="en-IN">I did not hear your response. Are you still there?</Speak>\n'
+        '    </GetInput>\n'
+        '    <Speak voice="WOMAN" language="en-IN">Thank you for calling Replora. Have a wonderful day. Goodbye!</Speak>\n'
+        '</Response>'
+    )
+    return Response(content=xml_content, media_type="application/xml")
+
+@app.api_route("/api/v1/telephony/inbound/turn", methods=["GET", "POST"])
+async def vobiz_inbound_turn(request: Request):
+    """Handle 2-way conversational voice turn from caller's speech over phone."""
+    content_type = request.headers.get("content-type", "")
+    carrier_data = {}
+    try:
+        if "application/json" in content_type:
+            carrier_data = await request.json()
+        else:
+            carrier_data = dict(await request.form())
+    except Exception:
+        pass
+
+    call_uuid = carrier_data.get("CallUUID", "call_session")
+    user_speech = (carrier_data.get("Speech") or carrier_data.get("SpeechResult") or carrier_data.get("Digits", "")).strip()
+    reason = carrier_data.get("Reason", "")
+    
+    logger.info("VoBiz 2-way turn: CallUUID=%s, Speech='%s', Reason=%s", call_uuid, user_speech, reason)
+    
+    public_domain = os.getenv("PUBLIC_DOMAIN", "waterlogged-marianela-overhonestly.ngrok-free.dev")
+    turn_url = f"https://{public_domain}/api/v1/telephony/inbound/turn"
+
+    # Handle silence or uncaptured speech
+    if not user_speech:
+        xml_content = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Response>\n'
+            f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.2" executionTimeout="12" language="en-IN">\n'
+            '        <Speak voice="WOMAN" language="en-IN">Sorry, I did not catch that. Could you please say that again?</Speak>\n'
+            '    </GetInput>\n'
+            '    <Speak voice="WOMAN" language="en-IN">Thank you for calling Replora. Goodbye!</Speak>\n'
+            '</Response>'
+        )
+        return Response(content=xml_content, media_type="application/xml")
+
+    # Conversation session history
+    if call_uuid not in phone_call_histories:
+        phone_call_histories[call_uuid] = []
+    
+    history = phone_call_histories[call_uuid]
+    history.append({"role": "user", "content": user_speech})
+    
+    # Check if caller wants to conclude the call
+    lower_speech = user_speech.lower()
+    if any(w in lower_speech for w in ["bye", "goodbye", "hang up", "alvida", "tata", "thank you bye", "bas itna hi"]):
+        reply_text = "Thank you so much for calling Replora. Have a wonderful day ahead! Goodbye!"
+        phone_call_histories.pop(call_uuid, None)
+        xml_content = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Response>\n'
+            f'    <Speak voice="WOMAN" language="en-IN">{reply_text}</Speak>\n'
+            '    <Hangup/>\n'
+            '</Response>'
+        )
+        return Response(content=xml_content, media_type="application/xml")
+
+    # Generate low-latency human conversational reply via Groq
+    try:
+        reply_text = await generate_llm_reply(history, user_speech)
+    except Exception as e:
+        logger.error("Error in conversational turn: %s", e)
+        reply_text = "I am right here with you. How can I assist you further?"
+
+    history.append({"role": "assistant", "content": reply_text})
+
+    # Clean reply text for XML compliance
+    safe_reply = (
+        reply_text.replace("&", "and")
+        .replace("<", "")
+        .replace(">", "")
+        .replace('"', "'")
+    )
+
+    # Return next interactive 2-way turn in call loop
+    xml_content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Response>\n'
+        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.2" executionTimeout="15" language="en-IN">\n'
+        f'        <Speak voice="WOMAN" language="en-IN">{safe_reply}</Speak>\n'
+        '    </GetInput>\n'
+        '    <Speak voice="WOMAN" language="en-IN">Thank you for speaking with Replora. Have a great day!</Speak>\n'
+        '</Response>'
+    )
+    return Response(content=xml_content, media_type="application/xml")
 
 @app.post("/api/v1/telephony/outbound")
 async def vobiz_outbound_call(call_req: OutboundCallRequest, request: Request):
@@ -297,27 +422,37 @@ async def vobiz_outbound_call(call_req: OutboundCallRequest, request: Request):
     auth_token = os.getenv("VOBIZ_AUTH_TOKEN")
     vobiz_num = os.getenv("VOBIZ_NUMBER")
 
-    if not auth_id or not auth_token:
-        logger.info("[Mock Call] VoBiz credentials not present. Mocking call to %s", call_req.target_number)
+    if not auth_id or not auth_token or not vobiz_num:
+        logger.info("[Mock Call] VoBiz credentials or number missing. Mocking call to %s", call_req.target_number)
         return {
             "status": "mock_initiated",
             "target": call_req.target_number,
-            "note": "Supply VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN, and VOBIZ_NUMBER in .env to place live calls."
+            "note": "Supply VOBIZ_NUMBER in .env to place live calls." if (auth_id and auth_token) else "Supply VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN, and VOBIZ_NUMBER in .env to place live calls."
         }
+
+    public_domain = os.getenv("PUBLIC_DOMAIN", "waterlogged-marianela-overhonestly.ngrok-free.dev")
+    answer_url = f"https://{public_domain}/api/v1/telephony/inbound/run"
+
+    # Normalize phone numbers for VoBiz
+    clean_from = vobiz_num.replace("+", "").strip()
+    clean_to = call_req.target_number.replace("+", "").strip()
 
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
-                "https://api.vobiz.ai/v1/calls",
+                f"https://api.vobiz.ai/api/v1/Account/{auth_id}/Call/",
                 auth=(auth_id, auth_token),
                 json={
-                    "from": vobiz_num,
-                    "to": call_req.target_number,
-                    "answer_url": f"https://{os.getenv('PUBLIC_DOMAIN')}/api/v1/telephony/inbound/run"
+                    "from": clean_from,
+                    "to": clean_to,
+                    "answer_url": answer_url,
+                    "answer_method": "POST"
                 },
-                timeout=10.0
+                timeout=12.0
             )
-            return resp.json()
+            data = resp.json()
+            logger.info("VoBiz call response [%d]: %s", resp.status_code, data)
+            return data
         except Exception as e:
             logger.error("VoBiz call dispatch error: %s", e)
             raise HTTPException(status_code=502, detail=str(e))

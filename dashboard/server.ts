@@ -229,13 +229,16 @@ async function main(): Promise<void> {
 
     // Multi-tenant Telephony Status API
     if (parsedUrl.pathname === '/api/telephony/status') {
+      const publicDomain = process.env.PUBLIC_DOMAIN || 'waterlogged-marianela-overhonestly.ngrok-free.dev';
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         vobiz: {
-          number: process.env.VOBIZ_NUMBER || '+919876543210',
-          answerUrl: '/api/v1/telephony/inbound/run',
-          status: process.env.VOBIZ_AUTH_ID ? 'configured' : 'mock_connected'
+          number: process.env.VOBIZ_NUMBER || '+918065354620',
+          answerUrl: `https://${publicDomain}/api/v1/telephony/inbound/run`,
+          authId: process.env.VOBIZ_AUTH_ID ? `VB_${process.env.VOBIZ_AUTH_ID.slice(0, 4)}••••` : 'Not Configured',
+          status: process.env.VOBIZ_AUTH_ID && process.env.VOBIZ_NUMBER ? 'connected' : 'mock_connected'
         },
+        testNumber: process.env.TEST_NUMBER || '+917211164751',
         voicelink: {
           did: process.env.VOICELINK_DID || '+918012345678',
           status: 'carrier_blocked',
