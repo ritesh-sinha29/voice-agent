@@ -318,16 +318,12 @@ async def vobiz_inbound_webhook(request: Request):
     public_domain = os.getenv("PUBLIC_DOMAIN", "waterlogged-marianela-overhonestly.ngrok-free.dev")
     turn_url = f"https://{public_domain}/api/v1/telephony/inbound/turn"
 
-    # Start interactive 2-way speech conversation
+    # Start interactive 2-way speech conversation: Deliver full greeting first, then listen
     xml_content = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Response>\n'
-        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.2" executionTimeout="15" language="en-IN">\n'
-        '        <Speak voice="WOMAN" language="en-IN">Namaste! Thank you for calling Replora. My name is Maya. How may I help you today?</Speak>\n'
-        '    </GetInput>\n'
-        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.2" executionTimeout="12" language="en-IN">\n'
-        '        <Speak voice="WOMAN" language="en-IN">I did not hear your response. Are you still there?</Speak>\n'
-        '    </GetInput>\n'
+        '    <Speak voice="WOMAN" language="en-IN">Namaste! Thank you for calling Replora. My name is Maya. How may I help you today?</Speak>\n'
+        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.5" executionTimeout="15" language="en-IN" />\n'
         '    <Speak voice="WOMAN" language="en-IN">Thank you for calling Replora. Have a wonderful day. Goodbye!</Speak>\n'
         '</Response>'
     )
@@ -352,9 +348,8 @@ async def vobiz_inbound_turn(request: Request):
         xml_content = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<Response>\n'
-            f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.2" executionTimeout="12" language="en-IN">\n'
-            '        <Speak voice="WOMAN" language="en-IN">Sorry, I did not catch that. Could you please say that again?</Speak>\n'
-            '    </GetInput>\n'
+            '    <Speak voice="WOMAN" language="en-IN">Sorry, I did not catch that. Could you please say that again?</Speak>\n'
+            f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.5" executionTimeout="15" language="en-IN" />\n'
             '    <Speak voice="WOMAN" language="en-IN">Thank you for calling Replora. Goodbye!</Speak>\n'
             '</Response>'
         )
@@ -367,9 +362,10 @@ async def vobiz_inbound_turn(request: Request):
     history = phone_call_histories[call_uuid]
     history.append({"role": "user", "content": user_speech})
     
-    # Check if caller wants to conclude the call
+    # Check if caller wants to conclude the call (exact phrases only, avoid false triggers like 'by the way')
     lower_speech = user_speech.lower()
-    if any(w in lower_speech for w in ["bye", "goodbye", "hang up", "alvida", "tata", "thank you bye", "bas itna hi"]):
+    conclude_phrases = ["goodbye", "bye bye", "thank you bye", "alvida", "stop call", "end call", "disconnect"]
+    if any(p in lower_speech for p in conclude_phrases) or re.search(r'\bbye\b', lower_speech):
         reply_text = "Thank you so much for calling Replora. Have a wonderful day ahead! Goodbye!"
         phone_call_histories.pop(call_uuid, None)
         xml_content = (
@@ -398,13 +394,12 @@ async def vobiz_inbound_turn(request: Request):
         .replace('"', "'")
     )
 
-    # Return next interactive 2-way turn in call loop
+    # Deliver complete speech before listening for user response (guarantees full thought delivery)
     xml_content = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Response>\n'
-        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.2" executionTimeout="15" language="en-IN">\n'
-        f'        <Speak voice="WOMAN" language="en-IN">{safe_reply}</Speak>\n'
-        '    </GetInput>\n'
+        f'    <Speak voice="WOMAN" language="en-IN">{safe_reply}</Speak>\n'
+        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="1.5" executionTimeout="15" language="en-IN" />\n'
         '    <Speak voice="WOMAN" language="en-IN">Thank you for speaking with Replora. Have a great day!</Speak>\n'
         '</Response>'
     )
@@ -472,7 +467,7 @@ HUMAN_RECEPTIONIST_PROMPT = (
     "   - If caller speaks Gujarati: Respond in natural spoken Gujarati (e.g. 'Namaste! Hu tamari madat kari shaku chu.').\n"
     "   - If caller speaks Punjabi: Respond in natural spoken Punjabi (e.g. 'Sat Sri Akal ji! Haanji, main tuhadi bilkul madad kar sakdi haan.').\n"
     "   - If caller speaks English: Respond in warm Indian English (e.g. 'Namaste! I would be delighted to assist you with that.').\n"
-    "3. Brevity: Strictly 1 to 2 spoken sentences (under 25 words). Never give long essays or bulleted lists.\n"
+    "3. Full Content Delivery: Speak in 2 to 3 complete, natural, and expressive sentences. Deliver your full thought clearly so the caller completely understands without feeling rushed. Do not trail off or stop mid-thought.\n"
     "4. Natural contractions: say 'I'm', 'we're', 'don't', 'it's', 'I'd'.\n"
     "5. NEVER output markdown symbols, asterisks, bullet points, numbered lists, hashtags, or emojis. They disrupt TTS synthesis.\n"
     "6. Format prices phonetically: say 'about one rupee per minute' or 'five hundred rupees', NEVER symbols like '₹1/min'."
@@ -507,7 +502,7 @@ async def generate_llm_reply(history: List[Dict[str, str]], query: str) -> str:
                         json={
                             "model": model_name,
                             "messages": messages,
-                            "max_tokens": 80,
+                            "max_tokens": 160,
                             "temperature": 0.7
                         }
                     )
@@ -656,19 +651,18 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                         active_turn_task = asyncio.create_task(handle_user_turn(final_text))
                     continue
 
-                # Handle SpeechStarted (Barge-in interrupt)
-                if msg_type == "SpeechStarted":
-                    if is_speaking:
-                        stop_agent_speech()
-                        await safe_send_json({"type": "barge_in_confirmed", "latencyMs": 16})
-                    continue
-
                 # Extract channel transcript
                 channel = msg.get("channel", {})
                 alternatives = channel.get("alternatives", [{}])
                 transcript = alternatives[0].get("transcript", "") if alternatives else ""
 
                 if transcript and transcript.strip():
+                    words = transcript.strip().split()
+                    # Word-level interruption: Interrupt immediately when user actually speaks words
+                    if is_speaking and len(words) >= 1:
+                        stop_agent_speech()
+                        await safe_send_json({"type": "barge_in_confirmed", "latencyMs": 16})
+
                     is_final = msg.get("is_final", False)
                     speech_final = msg.get("speech_final", False)
 

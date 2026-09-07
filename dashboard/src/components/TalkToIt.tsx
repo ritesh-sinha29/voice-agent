@@ -299,20 +299,6 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
           if (ws.readyState !== WebSocket.OPEN) return;
           const inputData = e.inputBuffer.getChannelData(0);
 
-          // Simple client-side VAD energy check for instant barge-in detection
-          let sum = 0;
-          for (let i = 0; i < inputData.length; i++) {
-            sum += inputData[i] * inputData[i];
-          }
-          const rms = Math.sqrt(sum / inputData.length);
-
-          // If user speaks while agent is speaking: trigger immediate barge-in stop
-          if (rms > 0.035 && isAgentSpeakingRef.current) {
-            stopAgentAudio();
-            ws.send(JSON.stringify({ type: 'barge_in' }));
-            setSessionState('listening');
-          }
-
           // Downsample from browser native sampleRate to 16000 Hz 16-bit linear PCM
           const pcm16 = downsampleTo16k(inputData, audioCtx.sampleRate);
           ws.send(pcm16.buffer);
@@ -349,6 +335,15 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
                   ...prev,
                   firstPartialTranscriptMs: Math.round(performance.now() - turnStartTimeRef.current)
                 }));
+              }
+
+              // Word-Level Interruption: Halt agent audio immediately when user actually speaks words
+              if (isAgentSpeakingRef.current && msg.text && msg.text.trim().split(/\s+/).length >= 1) {
+                stopAgentAudio();
+                if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+                  socketRef.current.send(JSON.stringify({ type: 'barge_in' }));
+                }
+                setSessionState('listening');
               }
               break;
 

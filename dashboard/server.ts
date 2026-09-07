@@ -161,7 +161,7 @@ const HUMAN_PROMPT =
   "   - If caller speaks Gujarati: Respond in natural spoken Gujarati (e.g. 'Namaste! Hu tamari madat kari shaku chu.').\n" +
   "   - If caller speaks Punjabi: Respond in natural spoken Punjabi (e.g. 'Sat Sri Akal ji! Haanji, main tuhadi bilkul madad kar sakdi haan.').\n" +
   "   - If caller speaks English: Respond in warm Indian English (e.g. 'Namaste! I would be delighted to assist you with that.').\n" +
-  "3. Brevity: Strictly 1 to 2 spoken sentences (under 25 words). Never provide long lists or essays.\n" +
+  "3. Full Content Delivery: Speak in 1 to 2 spoken sentences, natural, and expressive sentences. Deliver your full thought clearly so the caller completely understands without feeling rushed. Do not trail off or stop mid-thought.\n" +
   "4. Use spoken contractions: say 'I'm', 'we're', 'don't', 'it's', 'I'd'.\n" +
   "5. NEVER output markdown symbols, asterisks, bullet points, numbered lists, hashtags, or emojis. They sound terrible when read aloud.\n" +
   "6. Format prices and numbers phonetically: say 'about one rupee per minute' or 'five hundred rupees', NEVER symbols like '₹1/min'.";
@@ -411,14 +411,14 @@ async function main(): Promise<void> {
             return;
           }
 
-          // Handle SpeechStarted event (Instant Barge-in)
-          if (resp.type === 'SpeechStarted') {
-            stopAgentSpeech();
-            return;
-          }
-
           const transcript = resp.channel?.alternatives?.[0]?.transcript;
           if (transcript && transcript.trim()) {
+            const words = transcript.trim().split(/\s+/);
+            // Word-level interruption: Stop agent speech immediately when caller utters words
+            if (sessionState.isSpeaking && words.length >= 1) {
+              stopAgentSpeech();
+            }
+
             const isFinal = resp.is_final;
             const speechFinal = resp.speech_final;
 
@@ -499,7 +499,7 @@ async function main(): Promise<void> {
                   { role: 'system', content: HUMAN_PROMPT },
                   ...sessionState.history.slice(-6)
                 ],
-                max_tokens: 80,
+                max_tokens: 100,
                 temperature: 0.7
               })
             });
