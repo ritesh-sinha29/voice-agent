@@ -278,20 +278,30 @@ async def smoke_test_brain():
 # ------------------------------------------------------------------------------
 phone_call_histories: Dict[str, List[Dict[str, str]]] = {}
 
+import urllib.parse
+
+async def get_request_data(request: Request) -> Dict:
+    """Parse carrier request data from JSON or urlencoded form bodies."""
+    try:
+        content_type = request.headers.get("content-type", "").lower()
+        if "application/json" in content_type:
+            return await request.json()
+        
+        body_bytes = await request.body()
+        if body_bytes:
+            text = body_bytes.decode("utf-8", errors="ignore")
+            parsed = urllib.parse.parse_qs(text)
+            if parsed:
+                return {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+    except Exception as e:
+        logger.warning("Carrier body parse error: %s", e)
+    return {}
+
 @app.api_route("/api/v1/telephony/inbound/run", methods=["GET", "POST"])
 async def vobiz_inbound_webhook(request: Request):
     """VoBiz / Plivo Inbound & Initial Call Answer Webhook."""
     accept = request.headers.get("accept", "")
-    content_type = request.headers.get("content-type", "")
-    
-    carrier_data = {}
-    try:
-        if "application/json" in content_type:
-            carrier_data = await request.json()
-        else:
-            carrier_data = dict(await request.form())
-    except Exception:
-        pass
+    carrier_data = await get_request_data(request)
 
     call_uuid = carrier_data.get("CallUUID", "call_session")
     phone_call_histories[call_uuid] = []
@@ -326,15 +336,7 @@ async def vobiz_inbound_webhook(request: Request):
 @app.api_route("/api/v1/telephony/inbound/turn", methods=["GET", "POST"])
 async def vobiz_inbound_turn(request: Request):
     """Handle 2-way conversational voice turn from caller's speech over phone."""
-    content_type = request.headers.get("content-type", "")
-    carrier_data = {}
-    try:
-        if "application/json" in content_type:
-            carrier_data = await request.json()
-        else:
-            carrier_data = dict(await request.form())
-    except Exception:
-        pass
+    carrier_data = await get_request_data(request)
 
     call_uuid = carrier_data.get("CallUUID", "call_session")
     user_speech = (carrier_data.get("Speech") or carrier_data.get("SpeechResult") or carrier_data.get("Digits", "")).strip()
