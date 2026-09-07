@@ -63,6 +63,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [selectedAgent, setSelectedAgent] = useState('rumik-demo-agent');
   const [selectedBrain, setSelectedBrain] = useState<'groq' | 'gemini'>('groq');
+  const [selectedBackend, setSelectedBackend] = useState<'fastapi' | 'local'>('fastapi');
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
   const [interimCaption, setInterimCaption] = useState<string>('');
   const [typedMessage, setTypedMessage] = useState<string>('');
@@ -260,7 +261,9 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
 
       // 4. Connect to WebSocket
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws/talk`;
+      const hostname = window.location.hostname || 'localhost';
+      const wsPort = selectedBackend === 'fastapi' ? '8000' : (window.location.port || '8787');
+      const wsUrl = `${protocol}//${hostname}:${wsPort}/ws/talk`;
       const ws = new WebSocket(wsUrl);
       socketRef.current = ws;
       ws.binaryType = 'arraybuffer';
@@ -505,7 +508,20 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
         </div>
 
         {/* Configuration Bar */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+            <span style={{ color: 'var(--color-ink-muted)' }}>Backend:</span>
+            <select
+              value={selectedBackend}
+              onChange={(e) => setSelectedBackend(e.target.value as 'fastapi' | 'local')}
+              disabled={isSessionActive}
+              style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid var(--color-border)', background: 'var(--color-surface)', fontSize: 13, fontWeight: 500 }}
+            >
+              <option value="fastapi">⚡ FastAPI Agent (Port 8000)</option>
+              <option value="local">Next.js Engine (Port 8787)</option>
+            </select>
+          </div>
+
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
             <span style={{ color: 'var(--color-ink-muted)' }}>Brain:</span>
             <select

@@ -1,75 +1,30 @@
 services:
-  dograh-postgres:
-    image: postgres:16-alpine
-    container_name: dograh-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-dograh}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dograh_secret}
-      POSTGRES_DB: ${POSTGRES_DB:-dograh}
-    volumes:
-      - dograh_pgdata:/var/lib/postgresql/data
-    networks:
-      - dograh-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dograh"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  dograh-redis:
-    image: redis:7-alpine
-    container_name: dograh-redis
-    restart: unless-stopped
-    volumes:
-      - dograh_redisdata:/data
-    networks:
-      - dograh-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  dograh-api:
-    image: dograh/dograh-api:latest
-    container_name: dograh-api
+  fastapi-voice-agent:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.agent
+    container_name: fastapi-voice-agent
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "8000:8000"
+    env_file:
+      - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-dograh}:${POSTGRES_PASSWORD:-dograh_secret}@dograh-postgres:5432/${POSTGRES_DB:-dograh}
-      REDIS_URL: redis://dograh-redis:6379
-      ADMIN_EMAIL: ${DOGRAH_EMAIL:-admin@rumik-demo.local}
-      ADMIN_PASSWORD: ${DOGRAH_PASSWORD:-RumikDemoAdmin2026!}
-      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
-      GROQ_API_KEY: ${GROQ_API_KEY}
-      RUMIK_API_KEY: ${RUMIK_API_KEY}
-    depends_on:
-      dograh-postgres:
-        condition: service_healthy
-      dograh-redis:
-        condition: service_healthy
+      - AGENT_PORT=8000
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - RUMIK_API_KEY=${RUMIK_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - VOBIZ_AUTH_ID=${VOBIZ_AUTH_ID}
+      - VOBIZ_AUTH_TOKEN=${VOBIZ_AUTH_TOKEN}
+      - VOBIZ_NUMBER=${VOBIZ_NUMBER}
     networks:
-      - dograh-network
-
-  dograh-worker:
-    image: dograh/dograh-worker:latest
-    container_name: dograh-worker
-    restart: unless-stopped
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-dograh}:${POSTGRES_PASSWORD:-dograh_secret}@dograh-postgres:5432/${POSTGRES_DB:-dograh}
-      REDIS_URL: redis://dograh-redis:6379
-      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
-      GROQ_API_KEY: ${GROQ_API_KEY}
-      RUMIK_API_KEY: ${RUMIK_API_KEY}
-    depends_on:
-      dograh-postgres:
-        condition: service_healthy
-      dograh-redis:
-        condition: service_healthy
-    networks:
-      - dograh-network
+      - replora-voice-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   rumik-voice-studio:
     image: node:20-alpine
@@ -82,14 +37,13 @@ services:
     volumes:
       - ./dashboard:/app
     working_dir: /app
-    command: node server.js
+    command: sh -c "pnpm install && pnpm start"
+    depends_on:
+      fastapi-voice-agent:
+        condition: service_started
     networks:
-      - dograh-network
+      - replora-voice-network
 
 networks:
-  dograh-network:
-    name: dograh-network
-
-volumes:
-  dograh_pgdata:
-  dograh_redisdata:
+  replora-voice-network:
+    name: replora-voice-network
