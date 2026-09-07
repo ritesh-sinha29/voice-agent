@@ -311,7 +311,7 @@ async function main(): Promise<void> {
               'User-Agent': 'curl/8.21.0'
             },
             body: JSON.stringify({
-              model: 'llama-3.3-70b-versatile',
+              model: process.env.GROQ_MODEL || 'qwen/qwen3.8-27b',
               messages: [
                 {
                   role: 'system',

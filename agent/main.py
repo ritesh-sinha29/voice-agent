@@ -222,29 +222,37 @@ async def generate_llm_reply(history: List[Dict[str, str]], query: str) -> str:
     messages.append({"role": "user", "content": query})
 
     if GROQ_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                res = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json",
-                        "User-Agent": "curl/8.21.0"
-                    },
-                    json={
-                        "model": "llama-3.3-70b-versatile",
-                        "messages": messages,
-                        "max_tokens": 100,
-                        "temperature": 0.6
-                    }
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    if content:
-                        return content.strip()
-        except Exception as err:
-            logger.error("Groq generation error: %s", err)
+        models_to_try = [
+            os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
+            "qwen/qwen3.6-27b",
+            "openai/gpt-oss-20b",
+            "llama-3.3-70b-versatile"
+        ]
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            for model_name in models_to_try:
+                try:
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {GROQ_API_KEY}",
+                            "Content-Type": "application/json",
+                            "User-Agent": "curl/8.21.0"
+                        },
+                        json={
+                            "model": model_name,
+                            "messages": messages,
+                            "max_tokens": 100,
+                            "temperature": 0.6
+                        }
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        if content:
+                            logger.info("[Groq] Generated reply via %s: %s", model_name, content.strip()[:80])
+                            return content.strip()
+                except Exception as err:
+                    logger.warning("Groq model %s attempt failed: %s", model_name, err)
 
     return "Namaste! I would be happy to help you with that. Our voice stack runs from about one rupee per minute for STT, Groq, and Rumik TTS."
 
@@ -286,19 +294,33 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
             "&utterance_end_ms=1000"
         )
         try:
-            deepgram_ws = await websockets.connect(
-                dg_url,
-                extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-            )
-            logger.info("[FastAPI -> Deepgram] Nova-3 STT WebSocket connected.")
+            # Use additional_headers (supported in websockets 13, 14, 15)
+            headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+            try:
+                deepgram_ws = await websockets.connect(dg_url, additional_headers=headers)
+            except TypeError:
+                deepgram_ws = await websockets.connect(dg_url, extra_headers=headers)
+            logger.info("[FastAPI -> Deepgram] Nova-3 STT WebSocket connected successfully.")
         except Exception as e:
-            logger.error("Failed to connect to Deepgram: %s", e)
+            logger.error("Failed to connect to Deepgram Nova-3 STT: %s", e)
+
+    async def safe_send_json(payload: dict):
+        try:
+            await client_ws.send_json(payload)
+        except Exception:
+            pass
+
+    async def safe_send_bytes(data: bytes):
+        try:
+            await client_ws.send_bytes(data)
+        except Exception:
+            pass
 
     async def handle_user_turn(user_query: str):
         nonlocal is_speaking, history
         history.append({"role": "user", "content": user_query})
 
-        await client_ws.send_json({"type": "agent_thinking"})
+        await safe_send_json({"type": "agent_thinking"})
         start_time = time.time()
         reply_text = await generate_llm_reply(history, user_query)
         ttft_ms = int((time.time() - start_time) * 1000) or 155
@@ -306,7 +328,7 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
         history.append({"role": "assistant", "content": reply_text})
         is_speaking = True
 
-        await client_ws.send_json({
+        await safe_send_json({
             "type": "agent_reply_start",
             "text": reply_text,
             "ttftMs": ttft_ms,
@@ -315,7 +337,7 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
 
         # Send synthesized audio frame (24kHz WAV)
         audio = generate_synthetic_speech_pcm(2.2, 24000)
-        await client_ws.send_bytes(audio)
+        await safe_send_bytes(audio)
 
     async def deepgram_receiver():
         """Listen for transcription events from Deepgram Nova-3."""
@@ -335,7 +357,7 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                         turn_accumulator = ""
                         if debounce_task and not debounce_task.done():
                             debounce_task.cancel()
-                        await client_ws.send_json({"type": "transcript_final", "text": final_text})
+                        await safe_send_json({"type": "transcript_final", "text": final_text})
                         asyncio.create_task(handle_user_turn(final_text))
                     continue
 
@@ -344,7 +366,7 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                     if is_speaking:
                         is_speaking = False
                         logger.info("[Barge-in] Speech detected while agent speaking.")
-                        await client_ws.send_json({"type": "barge_in_confirmed", "latencyMs": 18})
+                        await safe_send_json({"type": "barge_in_confirmed", "latencyMs": 18})
                     continue
 
                 # Extract channel transcript
@@ -358,7 +380,7 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
 
                     if is_final:
                         turn_accumulator += (" " if turn_accumulator else "") + transcript.strip()
-                        await client_ws.send_json({
+                        await safe_send_json({
                             "type": "transcript_interim",
                             "text": turn_accumulator
                         })
@@ -368,7 +390,7 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                             turn_accumulator = ""
                             if debounce_task and not debounce_task.done():
                                 debounce_task.cancel()
-                            await client_ws.send_json({"type": "transcript_final", "text": final_text})
+                            await safe_send_json({"type": "transcript_final", "text": final_text})
                             asyncio.create_task(handle_user_turn(final_text))
                         else:
                             # 750ms safety silence debounce
@@ -381,13 +403,13 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                                 if turn_accumulator.strip():
                                     t = turn_accumulator.strip()
                                     turn_accumulator = ""
-                                    await client_ws.send_json({"type": "transcript_final", "text": t})
+                                    await safe_send_json({"type": "transcript_final", "text": t})
                                     asyncio.create_task(handle_user_turn(t))
 
                             debounce_task = asyncio.create_task(delayed_turn())
                     else:
                         preview = (turn_accumulator + " " if turn_accumulator else "") + transcript.strip()
-                        await client_ws.send_json({"type": "transcript_interim", "text": preview})
+                        await safe_send_json({"type": "transcript_interim", "text": preview})
 
         except asyncio.CancelledError:
             pass
@@ -402,14 +424,14 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
         await asyncio.sleep(0.5)
         greeting = "Namaste! Thanks for calling Replora. My name is Maya. How can I assist you today?"
         history.append({"role": "assistant", "content": greeting})
-        await client_ws.send_json({
+        await safe_send_json({
             "type": "agent_reply_start",
             "text": greeting,
             "ttftMs": 145,
             "ttsLatencyMs": 195
         })
         audio = generate_synthetic_speech_pcm(2.2, 24000)
-        await client_ws.send_bytes(audio)
+        await safe_send_bytes(audio)
 
     asyncio.create_task(send_greeting())
 
@@ -420,8 +442,11 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
 
             # 1. Binary Audio Frame (PCM 16kHz) -> Forward to Deepgram
             if "bytes" in message and message["bytes"]:
-                if deepgram_ws and deepgram_ws.open:
-                    await deepgram_ws.send(message["bytes"])
+                if deepgram_ws:
+                    try:
+                        await deepgram_ws.send(message["bytes"])
+                    except Exception as err:
+                        logger.error("Error forwarding audio to Deepgram: %s", err)
                 continue
 
             # 2. Text / Control JSON message
@@ -446,13 +471,19 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
     except WebSocketDisconnect:
         logger.info("[FastAPI WS] Client disconnected cleanly.")
     except Exception as e:
-        logger.error("[FastAPI WS] Connection error: %s", e)
+        if "disconnect" in str(e).lower():
+            logger.info("[FastAPI WS] Client disconnected.")
+        else:
+            logger.error("[FastAPI WS] Connection error: %s", e)
     finally:
         dg_task.cancel()
         if debounce_task and not debounce_task.done():
             debounce_task.cancel()
-        if deepgram_ws and deepgram_ws.open:
-            await deepgram_ws.close()
+        if deepgram_ws:
+            try:
+                await deepgram_ws.close()
+            except Exception:
+                pass
 
 # ------------------------------------------------------------------------------
 # Entrypoint Runner
