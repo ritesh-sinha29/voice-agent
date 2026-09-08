@@ -92,6 +92,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   const recognitionRef = useRef<any>(null);
   const animFrameRef = useRef<number | null>(null);
   const speechFallbackTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const endSessionRef = useRef<() => void>(() => {});
 
   // Auto-scroll transcripts
   useEffect(() => {
@@ -103,7 +104,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   // Clean up on component unmount
   useEffect(() => {
     return () => {
-      endSession();
+      endSessionRef.current();
     };
   }, []);
 
@@ -144,6 +145,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
   }, []);
 
   // Stop client audio playback immediately (barge-in or end)
+  // [H6] Nullifies .onended handlers BEFORE stopping to prevent ghost audio bleed.
   const stopAgentAudio = useCallback(() => {
     const interruptStartTime = performance.now();
 
@@ -156,21 +158,27 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
       window.speechSynthesis.cancel();
     }
 
-    // Stop currently playing source
+    // [H6] Stop currently playing source — nullify onended FIRST to prevent ghost dequeue
     if (activeAudioSourceRef.current) {
       try {
+        activeAudioSourceRef.current.onended = null;  // Prevent ghost audio chain
         activeAudioSourceRef.current.stop();
         activeAudioSourceRef.current.disconnect();
-      } catch (e) {}
+      } catch (e) {
+        // stop() throws InvalidStateError if node was never started — safe to ignore
+      }
       activeAudioSourceRef.current = null;
     }
 
-    // Clear queued buffers
+    // [H6] Clear queued buffers — nullify onended on each before stopping
     audioQueueRef.current.forEach((src) => {
       try {
+        src.onended = null;  // Prevent ghost audio chain
         src.stop();
         src.disconnect();
-      } catch (e) {}
+      } catch (e) {
+        // stop() throws InvalidStateError if node was never started — safe to ignore
+      }
     });
     audioQueueRef.current = [];
     isAgentSpeakingRef.current = false;
@@ -407,6 +415,19 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
 
             case 'error':
               setErrorMessage(msg.message || 'Pipeline error encountered');
+              // Reset UI state from stuck 'thinking' or 'speaking'
+              if (sessionState === 'thinking' || sessionState === 'speaking') {
+                stopAgentAudio();
+                setSessionState('listening');
+              }
+              break;
+
+            case 'agent_reply_end':
+              // Server signals turn is complete — recover from any stuck state
+              isAgentSpeakingRef.current = false;
+              if (sessionState === 'thinking') {
+                setSessionState('listening');
+              }
               break;
 
             default:
@@ -424,9 +445,8 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
       };
 
       ws.onclose = () => {
-        if (sessionState !== 'ended') {
-          setSessionState('idle');
-        }
+        // [L4] Use functional setter to avoid stale sessionState closure
+        setSessionState(prev => prev !== 'ended' ? 'idle' : prev);
       };
 
     } catch (err: any) {
@@ -487,6 +507,7 @@ export default function TalkToIt({ activeOrg }: TalkToItProps) {
     setSessionState('idle');
     setInterimCaption('');
   };
+  endSessionRef.current = endSession;
 
   // Accessibility typed input fallback
   const handleSendTypedMessage = (e: React.FormEvent) => {

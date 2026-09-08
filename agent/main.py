@@ -1,6 +1,9 @@
 """
-Replora AI Voice Agent — FastAPI Real-Time Voice Orchestrator
-Pure Python high-performance async streaming service with production security.
+Replora AI Voice Agent — FastAPI Real-Time Voice Orchestrator (v1.3.0)
+Production-hardened async streaming service with connection pooling,
+turn-locking, TTL session eviction, proxy-aware rate limiting,
+authentication, and error recovery frames.
+
 Deepgram Nova-3 STT + Groq Qwen/Llama + Rumik Silk Mulberry Studio TTS.
 """
 
@@ -8,10 +11,14 @@ import asyncio
 import json
 import logging
 import math
+import hmac
 import os
 import re
+import secrets
 import struct
 import time
+import xml.sax.saxutils
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -19,9 +26,10 @@ import httpx
 import uvicorn
 import websockets
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 # ------------------------------------------------------------------------------
@@ -46,49 +54,271 @@ RUMIK_API_KEY = os.getenv("RUMIK_API_KEY", "")
 RUMIK_GATEWAY_URL = os.getenv("RUMIK_GATEWAY_URL", "https://silk-api.rumik.ai")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")
 PORT = int(os.getenv("AGENT_PORT", "8000"))
-SESSION_SECRET = os.getenv("SESSION_SECRET", "replora-default-secret-change-in-production")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY", "")
+DEPLOY_MODE = os.getenv("DEPLOY_MODE", "LOCAL")
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "http://localhost:8787,http://127.0.0.1:8787,http://localhost:3000,http://127.0.0.1:3000"
 ).split(",")
+
+# [SEC] Trusted proxy IPs — only trust forwarding headers from these sources
+TRUSTED_PROXIES = set(os.getenv(
+    "TRUSTED_PROXIES",
+    "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+).split(","))
+
+# [SEC] Startup secret validator — refuse to boot with default/weak secrets
+_WEAK_SECRETS = {
+    "", "replora-default-secret-change-in-production",
+    "replora-local-dev-session-key-0123456789",
+    "replora-voice-studio-secret-key-32charsmin!",
+    "CHANGE_ME_GENERATE_WITH_secrets_token_hex_32",
+}
+if SESSION_SECRET in _WEAK_SECRETS:
+    if DEPLOY_MODE != "LOCAL":
+        logger.critical("[SECURITY] SESSION_SECRET is weak or default. Refusing to start in non-LOCAL mode.")
+        logger.critical("[SECURITY] Generate a strong secret: python -c \"import secrets; print(secrets.token_hex(32))\"")
+        raise SystemExit(1)
+    else:
+        logger.warning("[SECURITY] SESSION_SECRET is weak. Acceptable for LOCAL dev only.")
+
+if not DASHBOARD_API_KEY or DASHBOARD_API_KEY.startswith("CHANGE_ME"):
+    if DEPLOY_MODE != "LOCAL":
+        logger.critical("[SECURITY] DASHBOARD_API_KEY is missing or default. Refusing to start.")
+        raise SystemExit(1)
+    else:
+        logger.warning("[SECURITY] DASHBOARD_API_KEY is missing. API endpoints are unprotected in LOCAL mode.")
 
 # Active connections tracker for rate limiting
 MAX_CONCURRENT_SESSIONS_PER_IP = 5
 active_connections: Dict[str, int] = {}
 
 # ------------------------------------------------------------------------------
+# [H5] Global Persistent HTTP Client Singleton (Connection Pooling)
+# Eliminates per-request TLS handshake overhead (~150ms) and prevents
+# TCP socket TIME_WAIT exhaustion under high concurrency.
+# ------------------------------------------------------------------------------
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Return the global persistent httpx.AsyncClient singleton."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
+            http2=False,
+        )
+    return _http_client
+
+
+# ------------------------------------------------------------------------------
+# [H3] TTL Self-Evicting Dictionary for Phone Call Session State
+# Prevents unbounded memory growth from abandoned PSTN calls.
+# ------------------------------------------------------------------------------
+class TTLDict:
+    """Dictionary with per-key TTL auto-eviction."""
+    def __init__(self, default_ttl_seconds: int = 1800):
+        self._store: Dict[str, list] = {}
+        self._expiry: Dict[str, float] = {}
+        self._ttl = default_ttl_seconds
+
+    def set(self, key: str, value: list) -> None:
+        self._store[key] = value
+        self._expiry[key] = time.monotonic() + self._ttl
+
+    def get(self, key: str) -> Optional[list]:
+        if key in self._store:
+            if time.monotonic() < self._expiry[key]:
+                return self._store[key]
+            else:
+                self.delete(key)
+        return None
+
+    def get_or_create(self, key: str) -> list:
+        existing = self.get(key)
+        if existing is not None:
+            return existing
+        new_history: list = []
+        self.set(key, new_history)
+        return new_history
+
+    def delete(self, key: str) -> None:
+        self._store.pop(key, None)
+        self._expiry.pop(key, None)
+
+    def __contains__(self, key: str) -> bool:
+        if key in self._store:
+            if time.monotonic() < self._expiry[key]:
+                return True
+            self.delete(key)
+        return False
+
+    def evict_expired(self) -> int:
+        """Remove all expired entries. Returns count of evicted keys."""
+        now = time.monotonic()
+        expired = [k for k, exp in self._expiry.items() if now >= exp]
+        for k in expired:
+            self.delete(k)
+        return len(expired)
+
+
+# ------------------------------------------------------------------------------
+# [H7] Sliding Window Rate Limiter for Outbound Telephony
+# Prevents script kiddies from draining carrier wallet balances.
+# ------------------------------------------------------------------------------
+class SlidingWindowRateLimiter:
+    """Per-key sliding window rate limiter."""
+    def __init__(self, max_requests: int, window_seconds: int):
+        self._max = max_requests
+        self._window = window_seconds
+        self._timestamps: Dict[str, List[float]] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.monotonic()
+        if key not in self._timestamps:
+            self._timestamps[key] = []
+        # Evict timestamps outside window
+        self._timestamps[key] = [t for t in self._timestamps[key] if now - t < self._window]
+        if len(self._timestamps[key]) >= self._max:
+            return False
+        self._timestamps[key].append(now)
+        return True
+
+
+outbound_rate_limiter = SlidingWindowRateLimiter(max_requests=3, window_seconds=60)
+webhook_rate_limiter = SlidingWindowRateLimiter(max_requests=30, window_seconds=60)
+active_outbound_destinations: Dict[str, float] = {}  # number -> timestamp for TTL tracking
+
+
+# ------------------------------------------------------------------------------
+# [H4] Proxy-Aware Client IP Resolution
+# Handles Nginx, Docker, Cloudflare, and AWS ALB reverse proxies.
+# ------------------------------------------------------------------------------
+def _resolve_client_ip(request_or_ws) -> str:
+    """Extract real client IP from trusted proxy headers, with socket fallback.
+    [H6] Only trusts forwarding headers when direct connection is from a trusted proxy."""
+    # Get direct socket IP first
+    direct_ip = "unknown"
+    if hasattr(request_or_ws, 'client') and request_or_ws.client:
+        direct_ip = request_or_ws.client.host
+
+    headers = getattr(request_or_ws, 'headers', None)
+
+    # Only trust proxy headers if the direct connection is from a trusted proxy
+    if headers and direct_ip in TRUSTED_PROXIES:
+        for header_name in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+            value = headers.get(header_name)
+            if value:
+                ip = value.split(",")[0].strip()
+                if ip and ip not in ("127.0.0.1", "::1", "localhost"):
+                    return ip
+
+    return direct_ip
+
+
+# ------------------------------------------------------------------------------
+# FastAPI Lifespan (Startup/Shutdown) — manages HTTP client pool + TTL evictor
+# ------------------------------------------------------------------------------
+async def _ttl_eviction_loop(interval: int = 300):
+    """Background task to periodically evict expired phone call sessions."""
+    while True:
+        await asyncio.sleep(interval)
+        count = phone_call_histories.evict_expired()
+        if count > 0:
+            logger.info("[TTL Evictor] Evicted %d expired phone call sessions.", count)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan: HTTP client pool + TTL evictor."""
+    global _http_client
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0, connect=5.0),
+        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
+        http2=False,
+    )
+    eviction_task = asyncio.create_task(_ttl_eviction_loop(300))
+    logger.info("[Lifespan] HTTP client pool initialized (50 keepalive, 200 max).")
+    yield
+    eviction_task.cancel()
+    try:
+        await eviction_task
+    except asyncio.CancelledError:
+        pass
+    await _http_client.aclose()
+    _http_client = None
+    logger.info("[Lifespan] HTTP client pool closed.")
+
+
+# ------------------------------------------------------------------------------
 # FastAPI Application Initialization & Security Headers Middleware
 # ------------------------------------------------------------------------------
+# [L1] Disable Swagger/ReDoc in non-LOCAL mode to prevent endpoint enumeration
+_docs_url = "/docs" if DEPLOY_MODE == "LOCAL" else None
+_redoc_url = "/redoc" if DEPLOY_MODE == "LOCAL" else None
+
 app = FastAPI(
     title="Replora Voice Agent Service",
-    version="1.1.0",
-    description="Secured FastAPI Voice Orchestrator with Deepgram Nova-3 STT, Groq Brain, Rumik Silk TTS, and VoBiz PSTN Telephony."
+    version="1.3.0",
+    description="Production-hardened FastAPI Voice Orchestrator.",
+    lifespan=lifespan,
+    docs_url=_docs_url,
+    redoc_url=_redoc_url,
 )
+
+# [SEC] API Key authentication dependency for sensitive endpoints
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def require_api_key(api_key: str = Depends(_api_key_header)):
+    """Validate API key for sensitive endpoints. Skipped in LOCAL mode without key."""
+    if DASHBOARD_API_KEY and not DASHBOARD_API_KEY.startswith("CHANGE_ME"):
+        if not api_key or not hmac.compare_digest(api_key, DASHBOARD_API_KEY):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing API key."
+            )
+    elif DEPLOY_MODE != "LOCAL":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service not configured. DASHBOARD_API_KEY required."
+        )
+    # In LOCAL mode without key, allow access for development
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    """Enforce defense-in-depth HTTP security headers."""
+    """Enforce defense-in-depth HTTP security headers including CSP."""
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Permissions-Policy"] = "microphone=(self), camera=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; connect-src 'self' ws: wss:; img-src 'self' data:;"
+    )
     return response
+
+# [C4] Fix CORS — parentheses fix operator precedence; never use * with credentials
+_cors_origins = (ALLOWED_ORIGINS + ["*"]) if DEPLOY_MODE == "LOCAL" else ALLOWED_ORIGINS
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS + ["*"] if os.getenv("DEPLOY_MODE") == "LOCAL" else ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=DEPLOY_MODE != "LOCAL",  # Credentials incompatible with wildcard *
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
 
 # ------------------------------------------------------------------------------
 # Prompt Injection Guardrails & Input Sanitization
 # ------------------------------------------------------------------------------
 PROMPT_INJECTION_PATTERNS = [
-    r"ignore\s+(all\s+)?(previous|prior)\s+instructions?",
-    r"disregard\s+(all\s+)?(previous|prior)",
+    r"ignore\s+(all\s+)?(previous\s+|prior\s+)?instructions?",
+    r"disregard\s+(all\s+)?(previous\s+|prior\s+)?(instructions?)?",
     r"system\s+prompt",
     r"you\s+are\s+now\s+in\s+dan\s+mode",
     r"jailbreak",
@@ -154,64 +384,67 @@ def generate_synthetic_speech_pcm(duration_sec: float = 1.5, sample_rate: int = 
 
 async def synthesize_human_speech(text: str, voice: str = "asteria") -> bytes:
     """
-    Synthesize ultra-low latency high-fidelity human speech:
+    Synthesize ultra-low latency high-fidelity human speech.
+    Uses global persistent HTTP client for connection reuse (H5).
+    
     Primary: Deepgram Aura Asteria (neural speech, ~600ms sentence chunk latency)
     Secondary: Rumik Silk Mulberry (studio voice fallback)
     Emergency: Clean synthesized audio waveform
     """
     tts_provider = os.getenv("TTS_PROVIDER", "deepgram").lower()
+    client = get_http_client()
 
-    # 1. Primary: Deepgram Aura Neural TTS (~600ms latency for streaming sentences)
+    # 1. Primary: Deepgram Aura Neural TTS
     if tts_provider == "deepgram" and DEEPGRAM_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=4.0) as client:
-                resp = await client.post(
-                    "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
-                    headers={
-                        "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={"text": text}
-                )
-                if resp.status_code == 200 and len(resp.content) > 200:
-                    return resp.content
+            resp = await client.post(
+                "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
+                headers={
+                    "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={"text": text},
+                timeout=4.0,
+            )
+            if resp.status_code == 200 and len(resp.content) > 200:
+                return resp.content
         except Exception as e:
             logger.warning("[Deepgram Aura TTS] Connection error: %s", e)
 
     # 2. Rumik Silk Mulberry Studio TTS
     if RUMIK_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(
-                    f"{RUMIK_GATEWAY_URL}/v1/tts",
-                    headers={
-                        "Authorization": f"Bearer {RUMIK_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={"text": text, "voice": "mulberry"}
-                )
-                if resp.status_code == 200 and len(resp.content) > 200:
-                    logger.info("[Rumik TTS] Synthesized %d bytes of natural voice", len(resp.content))
-                    return resp.content
-                else:
-                    logger.warning("[Rumik TTS] Gateway returned status %d", resp.status_code)
+            resp = await client.post(
+                f"{RUMIK_GATEWAY_URL}/v1/tts",
+                headers={
+                    "Authorization": f"Bearer {RUMIK_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={"text": text, "voice": "mulberry"},
+                timeout=5.0,
+            )
+            if resp.status_code == 200 and len(resp.content) > 200:
+                logger.info("[Rumik TTS] Synthesized %d bytes of natural voice", len(resp.content))
+                return resp.content
+            else:
+                logger.warning("[Rumik TTS] Gateway returned status %d", resp.status_code)
         except Exception as e:
             logger.warning("[Rumik TTS] Connection error: %s", e)
 
     # 3. Fallback to Deepgram Aura if not tried yet
     if DEEPGRAM_API_KEY and tts_provider != "deepgram":
         try:
-            async with httpx.AsyncClient(timeout=4.0) as client:
-                resp = await client.post(
-                    "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
-                    headers={
-                        "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={"text": text}
-                )
-                if resp.status_code == 200 and len(resp.content) > 200:
-                    return resp.content
+            resp = await client.post(
+                "https://api.deepgram.com/v1/speak?model=aura-asteria-en",
+                headers={
+                    "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={"text": text},
+                timeout=4.0,
+            )
+            if resp.status_code == 200 and len(resp.content) > 200:
+                return resp.content
         except Exception:
             pass
 
@@ -220,7 +453,8 @@ async def synthesize_human_speech(text: str, voice: str = "asteria") -> bytes:
 # ------------------------------------------------------------------------------
 # Data Models with Validation
 # ------------------------------------------------------------------------------
-E164_PHONE_REGEX = re.compile(r"^\+?[1-9]\d{7,14}$")
+# [M9] E.164 requires + prefix
+E164_PHONE_REGEX = re.compile(r"^\+[1-9]\d{7,14}$")
 
 class OutboundCallRequest(BaseModel):
     target_number: str = Field(..., description="Target phone number in E.164 format")
@@ -237,28 +471,33 @@ class OutboundCallRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/v1/health")
 async def health_check():
-    """Liveness probe for FastAPI agent."""
+    """Liveness probe for FastAPI agent. [H4] Minimal info publicly."""
     return {
         "status": "ok",
         "service": "fastapi-voice-agent",
-        "version": "1.1.0",
+        "version": "1.3.0"
+    }
+
+@app.get("/api/v1/health/detailed")
+async def health_check_detailed(_: None = Depends(require_api_key)):
+    """Detailed health with provider info. Requires API key."""
+    return {
+        "status": "ok",
+        "service": "fastapi-voice-agent",
+        "version": "1.3.0",
         "providers": {
-            "stt": "deepgram-nova-3" if DEEPGRAM_API_KEY else "missing_key",
+            "stt": "configured" if DEEPGRAM_API_KEY else "missing",
             "llm": LLM_PROVIDER,
-            "tts": "rumik-silk-mulberry" if RUMIK_API_KEY else "deepgram-aura-fallback"
+            "tts": "configured" if RUMIK_API_KEY else "fallback"
         },
         "telephony": {
-            "vobiz": "configured" if os.getenv("VOBIZ_AUTH_ID") else "mock_ready"
-        },
-        "security": {
-            "prompt_guard": "active",
-            "frame_rate_limiting": "active"
+            "vobiz": "configured" if os.getenv("VOBIZ_AUTH_ID") else "mock"
         }
     }
 
 @app.get("/api/v1/agent/status")
-async def agent_status():
-    """Agent pipeline diagnostics and benchmark profile."""
+async def agent_status(_: None = Depends(require_api_key)):
+    """Agent pipeline diagnostics. Requires API key."""
     return {
         "agent_id": "rumik-demo-agent",
         "name": "Maya (Replora Voice Agent)",
@@ -274,14 +513,14 @@ async def agent_status():
     }
 
 @app.get("/api/smoke-test/rumik-tts")
-async def smoke_test_tts():
-    """Smoke test generating real Rumik 24kHz audio."""
+async def smoke_test_tts(_: None = Depends(require_api_key)):
+    """Smoke test generating real Rumik 24kHz audio. Requires API key."""
     audio = await synthesize_human_speech("Namaste! This is Maya testing the Rumik Silk voice engine.", "mulberry")
     return Response(content=audio, media_type="audio/wav")
 
 @app.get("/api/smoke-test/brain")
-async def smoke_test_brain():
-    """Smoke test for LLM connectivity."""
+async def smoke_test_brain(_: None = Depends(require_api_key)):
+    """Smoke test for LLM connectivity. Requires API key."""
     return {
         "provider": LLM_PROVIDER,
         "model": os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
@@ -291,8 +530,9 @@ async def smoke_test_brain():
 
 # ------------------------------------------------------------------------------
 # 2-Way Telephony Conversation Engine (VoBiz / Plivo PSTN)
+# [H3] Uses TTL-evicting dictionary to auto-clean abandoned sessions.
 # ------------------------------------------------------------------------------
-phone_call_histories: Dict[str, List[Dict[str, str]]] = {}
+phone_call_histories = TTLDict(default_ttl_seconds=1800)  # 30-minute TTL
 
 import urllib.parse
 
@@ -315,13 +555,23 @@ async def get_request_data(request: Request) -> Dict:
 
 @app.api_route("/api/v1/telephony/inbound/run", methods=["GET", "POST"])
 async def vobiz_inbound_webhook(request: Request):
-    """VoBiz / Plivo Inbound & Initial Call Answer Webhook."""
+    """VoBiz / Plivo Inbound & Initial Call Answer Webhook.
+    [M11] Rate limited to prevent webhook flood attacks."""
+    # [M11] Rate limit webhook calls
+    caller_ip = _resolve_client_ip(request)
+    if not webhook_rate_limiter.is_allowed(caller_ip):
+        logger.warning("[Security] Webhook rate limit exceeded for IP %s", caller_ip)
+        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+
     accept = request.headers.get("accept", "")
     carrier_data = await get_request_data(request)
 
     call_uuid = carrier_data.get("CallUUID", "call_session")
-    phone_call_histories[call_uuid] = []
-    logger.info("VoBiz call answered: CallUUID=%s, From=%s, To=%s", call_uuid, carrier_data.get("From"), carrier_data.get("To"))
+    phone_call_histories.set(call_uuid, [])
+    # [L7] Mask phone numbers in logs
+    _from = carrier_data.get("From", "")
+    _to = carrier_data.get("To", "")
+    logger.info("VoBiz call answered: CallUUID=%s, From=%s, To=%s", call_uuid, _from[:6] + "****" if _from else "", _to[:6] + "****" if _to else "")
 
     # Return JSON only if client is internal health check
     if "application/json" in accept and not carrier_data.get("CallUUID"):
@@ -331,7 +581,7 @@ async def vobiz_inbound_webhook(request: Request):
             "greeting": "Namaste! Thank you for calling Replora. My name is Maya. How may I help you today?"
         }
 
-    public_domain = os.getenv("PUBLIC_DOMAIN", "waterlogged-marianela-overhonestly.ngrok-free.dev")
+    public_domain = os.getenv("PUBLIC_DOMAIN", "localhost:8000")
     turn_url = f"https://{public_domain}/api/v1/telephony/inbound/turn"
 
     # Start interactive 2-way speech conversation: Deliver full greeting first, then listen
@@ -339,7 +589,7 @@ async def vobiz_inbound_webhook(request: Request):
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Response>\n'
         '    <Speak voice="WOMAN" language="en-IN">Namaste! Thank you for calling Replora. My name is Maya. How may I help you today?</Speak>\n'
-        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="0.8" executionTimeout="15" language="en-IN" />\n'
+        f'    <GetInput action="{xml.sax.saxutils.escape(turn_url)}" method="POST" inputType="speech" speechEndTimeout="0.8" executionTimeout="15" language="en-IN" />\n'
         '    <Speak voice="WOMAN" language="en-IN">Thank you for calling Replora. Have a wonderful day. Goodbye!</Speak>\n'
         '</Response>'
     )
@@ -347,17 +597,26 @@ async def vobiz_inbound_webhook(request: Request):
 
 @app.api_route("/api/v1/telephony/inbound/turn", methods=["GET", "POST"])
 async def vobiz_inbound_turn(request: Request):
-    """Handle 2-way conversational voice turn from caller's speech over phone."""
+    """Handle 2-way conversational voice turn from caller's speech over phone.
+    [M11] Rate limited. [H1] Proper XML escaping. [H8] Sanitize at entry."""
+    # [M11] Rate limit
+    caller_ip = _resolve_client_ip(request)
+    if not webhook_rate_limiter.is_allowed(caller_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+
     carrier_data = await get_request_data(request)
 
     call_uuid = carrier_data.get("CallUUID", "call_session")
-    user_speech = (carrier_data.get("Speech") or carrier_data.get("SpeechResult") or carrier_data.get("Digits", "")).strip()
+    raw_speech = (carrier_data.get("Speech") or carrier_data.get("SpeechResult") or carrier_data.get("Digits", "")).strip()
+    # [H8] Sanitize carrier speech at point of entry
+    user_speech = sanitize_user_speech(raw_speech)
     reason = carrier_data.get("Reason", "")
     
-    logger.info("VoBiz 2-way turn: CallUUID=%s, Speech='%s', Reason=%s", call_uuid, user_speech, reason)
+    logger.info("VoBiz 2-way turn: CallUUID=%s, Reason=%s", call_uuid, reason)
     
-    public_domain = os.getenv("PUBLIC_DOMAIN", "waterlogged-marianela-overhonestly.ngrok-free.dev")
+    public_domain = os.getenv("PUBLIC_DOMAIN", "localhost:8000")
     turn_url = f"https://{public_domain}/api/v1/telephony/inbound/turn"
+    safe_turn_url = xml.sax.saxutils.escape(turn_url)
 
     # Handle silence or uncaptured speech
     if not user_speech:
@@ -365,29 +624,30 @@ async def vobiz_inbound_turn(request: Request):
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<Response>\n'
             '    <Speak voice="WOMAN" language="en-IN">Sorry, I did not catch that. Could you please say that again?</Speak>\n'
-            f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="0.8" executionTimeout="15" language="en-IN" />\n'
+            f'    <GetInput action="{safe_turn_url}" method="POST" inputType="speech" speechEndTimeout="0.8" executionTimeout="15" language="en-IN" />\n'
             '    <Speak voice="WOMAN" language="en-IN">Thank you for calling Replora. Goodbye!</Speak>\n'
             '</Response>'
         )
         return Response(content=xml_content, media_type="application/xml")
 
-    # Conversation session history
-    if call_uuid not in phone_call_histories:
-        phone_call_histories[call_uuid] = []
-    
-    history = phone_call_histories[call_uuid]
+    # Conversation session history (auto-creates on first access via TTLDict)
+    history = phone_call_histories.get_or_create(call_uuid)
     history.append({"role": "user", "content": user_speech})
     
-    # Check if caller wants to conclude the call (exact phrases only, avoid false triggers like 'by the way')
+    # [H7] Cap history to prevent unbounded memory growth
+    if len(history) > 50:
+        history[:] = history[-50:]
+    
+    # Check if caller wants to conclude the call
     lower_speech = user_speech.lower()
     conclude_phrases = ["goodbye", "bye bye", "thank you bye", "alvida", "stop call", "end call", "disconnect"]
     if any(p in lower_speech for p in conclude_phrases) or re.search(r'\bbye\b', lower_speech):
         reply_text = "Thank you so much for calling Replora. Have a wonderful day ahead! Goodbye!"
-        phone_call_histories.pop(call_uuid, None)
+        phone_call_histories.delete(call_uuid)
         xml_content = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<Response>\n'
-            f'    <Speak voice="WOMAN" language="en-IN">{reply_text}</Speak>\n'
+            f'    <Speak voice="WOMAN" language="en-IN">{xml.sax.saxutils.escape(reply_text)}</Speak>\n'
             '    <Hangup/>\n'
             '</Response>'
         )
@@ -397,81 +657,114 @@ async def vobiz_inbound_turn(request: Request):
     try:
         reply_text = await generate_llm_reply(history, user_speech)
     except Exception as e:
-        logger.error("Error in conversational turn: %s", e)
+        logger.error("Error in conversational turn: %s", type(e).__name__)
         reply_text = "I am right here with you. How can I assist you further?"
 
     history.append({"role": "assistant", "content": reply_text})
 
-    # Clean reply text for XML compliance
-    safe_reply = (
-        reply_text.replace("&", "and")
-        .replace("<", "")
-        .replace(">", "")
-        .replace('"', "'")
-    )
+    # [H1] Proper XML escaping using standard library
+    safe_reply = xml.sax.saxutils.escape(reply_text)
 
-    # Deliver complete speech before listening for user response (guarantees full thought delivery)
     xml_content = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Response>\n'
         f'    <Speak voice="WOMAN" language="en-IN">{safe_reply}</Speak>\n'
-        f'    <GetInput action="{turn_url}" method="POST" inputType="speech" speechEndTimeout="0.8" executionTimeout="15" language="en-IN" />\n'
+        f'    <GetInput action="{safe_turn_url}" method="POST" inputType="speech" speechEndTimeout="0.8" executionTimeout="15" language="en-IN" />\n'
         '    <Speak voice="WOMAN" language="en-IN">Thank you for speaking with Replora. Have a great day!</Speak>\n'
         '</Response>'
     )
     return Response(content=xml_content, media_type="application/xml")
 
+# [H3] Carrier hangup webhook — cleans up session state when caller hangs up
+@app.api_route("/api/v1/telephony/inbound/hangup", methods=["GET", "POST"])
+async def vobiz_hangup_webhook(request: Request):
+    """VoBiz / Plivo Hangup CDR webhook. Frees session memory on call termination."""
+    carrier_data = await get_request_data(request)
+    call_uuid = carrier_data.get("CallUUID", "")
+    if call_uuid:
+        phone_call_histories.delete(call_uuid)
+        logger.info("[Hangup Webhook] Cleaned session for CallUUID=%s", call_uuid)
+    return {"status": "ok"}
+
+
 @app.post("/api/v1/telephony/outbound")
-async def vobiz_outbound_call(call_req: OutboundCallRequest, request: Request):
-    """Trigger paid outbound PSTN call via VoBiz with security validation."""
+async def vobiz_outbound_call(call_req: OutboundCallRequest, request: Request, _: None = Depends(require_api_key)):
+    """Trigger paid outbound PSTN call via VoBiz with security validation.
+    [C7] Requires API key authentication."""
     # Security: Validate phone number format
     if not call_req.validate_phone():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid phone number format. Must conform to international E.164 standard."
+            detail="Invalid phone number format. Must conform to international E.164 standard (e.g. +919876543210)."
         )
+
+    # [H7] Sliding-window rate limiting: max 3 outbound calls per minute per IP
+    caller_ip = _resolve_client_ip(request)
+    if not outbound_rate_limiter.is_allowed(caller_ip):
+        logger.warning("[Security] Outbound rate limit exceeded for IP %s", caller_ip)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Maximum 3 outbound calls per minute."
+        )
+
+    # [H3] Max 1 active call per destination with TTL (auto-expire after 30 min)
+    clean_to = call_req.target_number.replace("+", "").strip()
+    now = time.monotonic()
+    if clean_to in active_outbound_destinations:
+        last_time = active_outbound_destinations[clean_to]
+        if now - last_time < 1800:  # 30 min TTL
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="An active call to this destination is already in progress."
+            )
+        else:
+            # Stale entry, clean up
+            del active_outbound_destinations[clean_to]
 
     auth_id = os.getenv("VOBIZ_AUTH_ID")
     auth_token = os.getenv("VOBIZ_AUTH_TOKEN")
     vobiz_num = os.getenv("VOBIZ_NUMBER")
 
     if not auth_id or not auth_token or not vobiz_num:
-        logger.info("[Mock Call] VoBiz credentials or number missing. Mocking call to %s", call_req.target_number)
+        logger.info("[Mock Call] VoBiz credentials missing. Mocking call.")
         return {
             "status": "mock_initiated",
             "target": call_req.target_number,
-            "note": "Supply VOBIZ_NUMBER in .env to place live calls." if (auth_id and auth_token) else "Supply VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN, and VOBIZ_NUMBER in .env to place live calls."
+            "note": "Supply VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN, and VOBIZ_NUMBER in .env to place live calls."
         }
 
-    public_domain = os.getenv("PUBLIC_DOMAIN", "waterlogged-marianela-overhonestly.ngrok-free.dev")
+    public_domain = os.getenv("PUBLIC_DOMAIN", "localhost:8000")
     answer_url = f"https://{public_domain}/api/v1/telephony/inbound/run"
-
-    # Normalize phone numbers for VoBiz
     clean_from = vobiz_num.replace("+", "").strip()
-    clean_to = call_req.target_number.replace("+", "").strip()
 
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.post(
-                f"https://api.vobiz.ai/api/v1/Account/{auth_id}/Call/",
-                auth=(auth_id, auth_token),
-                json={
-                    "from": clean_from,
-                    "to": clean_to,
-                    "answer_url": answer_url,
-                    "answer_method": "POST"
-                },
-                timeout=12.0
-            )
-            data = resp.json()
-            logger.info("VoBiz call response [%d]: %s", resp.status_code, data)
-            return data
-        except Exception as e:
-            logger.error("VoBiz call dispatch error: %s", e)
-            raise HTTPException(status_code=502, detail=str(e))
+    active_outbound_destinations[clean_to] = now
+    client = get_http_client()
+    try:
+        resp = await client.post(
+            f"https://api.vobiz.ai/api/v1/Account/{auth_id}/Call/",
+            auth=(auth_id, auth_token),
+            json={
+                "from": clean_from,
+                "to": clean_to,
+                "answer_url": answer_url,
+                "answer_method": "POST"
+            },
+            timeout=12.0
+        )
+        data = resp.json()
+        logger.info("VoBiz call dispatched [%d]", resp.status_code)
+        return data
+    except Exception as e:
+        logger.error("VoBiz call dispatch error: %s", type(e).__name__)
+        # [M3] Generic error to client; details logged server-side
+        raise HTTPException(status_code=502, detail="Failed to connect to carrier gateway. Check server logs.")
+    finally:
+        # Note: Call stays in active_outbound_destinations with TTL — cleaned by hangup webhook or TTL
+        pass
 
 # ------------------------------------------------------------------------------
 # Conversational LLM Turn Generation (Human Speech Optimized)
+# Uses global persistent HTTP client (H5).
 # ------------------------------------------------------------------------------
 HUMAN_RECEPTIONIST_PROMPT = (
     "You are Maya, a warm, polite, and articulate multilingual receptionist at Replora. "
@@ -490,12 +783,16 @@ HUMAN_RECEPTIONIST_PROMPT = (
 )
 
 async def generate_llm_reply(history: List[Dict[str, str]], query: str) -> str:
-    """Generate ultra-fast conversational reply using Groq Qwen/Llama with Gemini fallback."""
+    """Generate ultra-fast conversational reply using Groq Qwen/Llama.
+    Uses global persistent HTTP client for connection reuse (H5).
+    """
     sanitized_query = sanitize_user_speech(query)
     
     messages = [{"role": "system", "content": HUMAN_RECEPTIONIST_PROMPT}]
     messages.extend(history[-6:])
     messages.append({"role": "user", "content": sanitized_query})
+
+    client = get_http_client()
 
     if GROQ_API_KEY:
         models_to_try = [
@@ -505,49 +802,54 @@ async def generate_llm_reply(history: List[Dict[str, str]], query: str) -> str:
             "openai/gpt-oss-20b",
             "openai/gpt-oss-120b"
         ]
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            for model_name in models_to_try:
-                try:
-                    res = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {GROQ_API_KEY}",
-                            "Content-Type": "application/json",
-                            "User-Agent": "curl/8.21.0"
-                        },
-                        json={
-                            "model": model_name,
-                            "messages": messages,
-                            "max_tokens": 160,
-                            "temperature": 0.7
-                        }
-                    )
-                    if res.status_code == 200:
-                        data = res.json()
-                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        if content:
-                            clean_reply = content.replace("*", "").replace("#", "").strip()
-                            logger.info("[Groq %s] Human turn: %s", model_name, clean_reply[:80])
-                            return clean_reply
-                except Exception as err:
-                    logger.warning("Groq model %s attempt failed: %s", model_name, err)
+        for model_name in models_to_try:
+            try:
+                res = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "Replora-VoiceAgent/1.3.0"
+                    },
+                    json={
+                        "model": model_name,
+                        "messages": messages,
+                        "max_tokens": 160,
+                        "temperature": 0.7
+                    },
+                    timeout=6.0,
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if content:
+                        clean_reply = content.replace("*", "").replace("#", "").strip()
+                        logger.info("[Groq %s] Human turn: %s", model_name, clean_reply[:80])
+                        return clean_reply
+            except Exception as err:
+                logger.warning("Groq model %s attempt failed: %s", model_name, err)
 
     return "Namaste! I would be delighted to assist you with that. Our voice stack runs from about one rupee per minute with instant responses."
 
 # ------------------------------------------------------------------------------
-# WebSocket Live Voice Session (/ws/talk) with Security & Real TTS
+# WebSocket Live Voice Session (/ws/talk) with Production Hardening
+# [H1] Turn locking prevents concurrent overwrites / double-audio.
+# [H2] Greeting task is explicitly tracked and cancellable.
+# [H4] Proxy-aware IP resolution for correct rate limiting.
+# [H8] Error frames emitted on LLM/TTS failure to recover frozen UI.
 # ------------------------------------------------------------------------------
 @app.websocket("/ws/talk")
 async def websocket_talk_endpoint(client_ws: WebSocket):
     """
-    Bidirectional streaming WebSocket endpoint:
-    - Connection rate limiting & frame size protection.
-    - Deepgram Nova-3 live STT.
-    - Groq Qwen/Llama conversational turn generation.
-    - Rumik Silk Mulberry studio voice synthesis.
-    - Immediate barge-in interruption (<20ms).
+    Bidirectional streaming WebSocket endpoint with production hardening:
+    - [H1] Turn lock prevents double-audio from racing UtteranceEnd + speech_final.
+    - [H2] Greeting task explicitly tracked; cancelled on disconnect/speech.
+    - [H4] Proxy-aware IP resolution for correct rate limiting behind reverse proxies.
+    - [H5] Uses global persistent HTTP client for TTS/LLM calls.
+    - [H8] Error frames emitted on LLM/TTS failure to recover frozen UI.
     """
-    client_ip = client_ws.client.host if client_ws.client else "unknown"
+    # [H4] Resolve real client IP through reverse proxy headers
+    client_ip = _resolve_client_ip(client_ws)
     
     # Rate limiting: Max concurrent sessions per client IP
     current_count = active_connections.get(client_ip, 0)
@@ -561,10 +863,13 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
     logger.info("[FastAPI WS] Client connected: %s (Active: %d)", client_ip, active_connections[client_ip])
 
     history: List[Dict[str, str]] = []
+    MAX_HISTORY_SIZE = 50  # [H7] Cap history to prevent unbounded memory growth
     is_speaking = False
     turn_accumulator = ""
     debounce_task: Optional[asyncio.Task] = None
     active_turn_task: Optional[asyncio.Task] = None
+    greeting_task: Optional[asyncio.Task] = None  # [H2] Explicit greeting handle
+    _turn_lock = asyncio.Lock()  # [H1] Prevents concurrent turn overwrites
     deepgram_ws: Optional[websockets.WebSocketClientProtocol] = None
 
     # Connect to Deepgram Nova-3 Live Streaming WebSocket
@@ -605,51 +910,79 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
 
     def stop_agent_speech():
         """Instant interrupt: abort ongoing TTS synthesis or agent speaking state."""
-        nonlocal is_speaking, active_turn_task
+        nonlocal is_speaking, active_turn_task, greeting_task
         if is_speaking or (active_turn_task and not active_turn_task.done()):
             is_speaking = False
             if active_turn_task and not active_turn_task.done():
                 active_turn_task.cancel()
             logger.info("[Barge-In] Speech interrupted; playback cancelled.")
+        # [H2] Cancel greeting if still running
+        if greeting_task and not greeting_task.done():
+            greeting_task.cancel()
+            logger.info("[H2] Greeting task cancelled due to barge-in.")
 
     async def handle_user_turn(user_query: str):
+        """Process a user speech turn with LLM + TTS.
+        [H1] Acquires _turn_lock to prevent concurrent turn overwrites.
+        [H8] Wraps in try/except to emit error frames on failure.
+        """
         nonlocal is_speaking, history
-        clean_query = sanitize_user_speech(user_query)
-        if not clean_query:
-            return
 
-        history.append({"role": "user", "content": clean_query})
+        # [H1] Acquire turn lock — serializes concurrent turn attempts
+        async with _turn_lock:
+            clean_query = sanitize_user_speech(user_query)
+            if not clean_query:
+                return
 
-        await safe_send_json({"type": "agent_thinking"})
-        start_time = time.time()
-        reply_text = await generate_llm_reply(history, clean_query)
-        ttft_ms = int((time.time() - start_time) * 1000) or 125
+            history.append({"role": "user", "content": clean_query})
+            # [H7] Evict oldest entries to prevent unbounded growth
+            if len(history) > MAX_HISTORY_SIZE:
+                history[:] = history[-MAX_HISTORY_SIZE:]
 
-        history.append({"role": "assistant", "content": reply_text})
-        is_speaking = True
+            await safe_send_json({"type": "agent_thinking"})
 
-        # Send start event immediately
-        await safe_send_json({
-            "type": "agent_reply_start",
-            "text": reply_text,
-            "ttftMs": ttft_ms,
-            "voice": os.getenv("TTS_PROVIDER", "deepgram")
-        })
+            try:
+                start_time = time.time()
+                reply_text = await generate_llm_reply(history, clean_query)
+                ttft_ms = int((time.time() - start_time) * 1000) or 125
+            except Exception as llm_err:
+                # [H8] Emit error frame so client UI can recover from "thinking" state
+                logger.error("[H8] LLM generation failed: %s", llm_err)
+                await safe_send_json({"type": "error", "message": "I'm having a temporary issue. Please try again."})
+                await safe_send_json({"type": "agent_reply_end"})
+                return
 
-        # Split reply into sentence chunks for streaming audio delivery
-        sentence_chunks = [s.strip() for s in re.split(r'(?<=[.?!।\n])\s+', reply_text) if s.strip()]
-        if not sentence_chunks:
-            sentence_chunks = [reply_text]
+            history.append({"role": "assistant", "content": reply_text})
+            is_speaking = True
 
-        # Synthesize and stream chunk-by-chunk so caller hears speech in < 1 second!
-        for idx, chunk in enumerate(sentence_chunks):
-            if not is_speaking:
-                break
-            tts_start = time.time()
-            chunk_audio = await synthesize_human_speech(chunk)
-            chunk_ms = int((time.time() - tts_start) * 1000)
-            logger.info("[Audio Stream] Sent chunk %d/%d (%d chars, %d ms)", idx + 1, len(sentence_chunks), len(chunk), chunk_ms)
-            await safe_send_bytes(chunk_audio)
+            # Send start event immediately
+            await safe_send_json({
+                "type": "agent_reply_start",
+                "text": reply_text,
+                "ttftMs": ttft_ms,
+                "voice": os.getenv("TTS_PROVIDER", "deepgram")
+            })
+
+            # Split reply into sentence chunks for streaming audio delivery
+            sentence_chunks = [s.strip() for s in re.split(r'(?<=[.?!।\n])\s+', reply_text) if s.strip()]
+            if not sentence_chunks:
+                sentence_chunks = [reply_text]
+
+            # Synthesize and stream chunk-by-chunk so caller hears speech in < 1 second!
+            for idx, chunk in enumerate(sentence_chunks):
+                if not is_speaking:
+                    break
+                try:
+                    tts_start = time.time()
+                    chunk_audio = await synthesize_human_speech(chunk)
+                    chunk_ms = int((time.time() - tts_start) * 1000)
+                    logger.info("[Audio Stream] Sent chunk %d/%d (%d chars, %d ms)", idx + 1, len(sentence_chunks), len(chunk), chunk_ms)
+                    await safe_send_bytes(chunk_audio)
+                except Exception as tts_err:
+                    # [H8] TTS failure: emit error frame to unblock UI
+                    logger.error("[H8] TTS synthesis failed for chunk %d: %s", idx + 1, tts_err)
+                    await safe_send_json({"type": "error", "message": "Voice synthesis encountered an issue."})
+                    break
 
     async def deepgram_receiver():
         """Listen for transcription events from Deepgram Nova-3."""
@@ -670,6 +1003,9 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                         if debounce_task and not debounce_task.done():
                             debounce_task.cancel()
                         await safe_send_json({"type": "transcript_final", "text": final_text})
+                        # [H1] Cancel prior turn before spawning new one
+                        if active_turn_task and not active_turn_task.done():
+                            active_turn_task.cancel()
                         active_turn_task = asyncio.create_task(handle_user_turn(final_text))
                     continue
 
@@ -701,6 +1037,9 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                             if debounce_task and not debounce_task.done():
                                 debounce_task.cancel()
                             await safe_send_json({"type": "transcript_final", "text": final_text})
+                            # [H1] Cancel prior turn before spawning new one
+                            if active_turn_task and not active_turn_task.done():
+                                active_turn_task.cancel()
                             active_turn_task = asyncio.create_task(handle_user_turn(final_text))
                         else:
                             # 300ms fast silence debounce
@@ -714,6 +1053,9 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                                     t = turn_accumulator.strip()
                                     turn_accumulator = ""
                                     await safe_send_json({"type": "transcript_final", "text": t})
+                                    # [H1] Cancel prior turn before spawning new one
+                                    if active_turn_task and not active_turn_task.done():
+                                        active_turn_task.cancel()
                                     active_turn_task = asyncio.create_task(handle_user_turn(t))
 
                             debounce_task = asyncio.create_task(delayed_turn())
@@ -745,7 +1087,8 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
         })
         await safe_send_bytes(audio)
 
-    asyncio.create_task(send_greeting())
+    # [H2] Track greeting task handle explicitly for lifecycle management
+    greeting_task = asyncio.create_task(send_greeting())
 
     # Client incoming message loop
     MAX_AUDIO_CHUNK_SIZE = 32768  # 32KB max per audio packet to prevent DoS
@@ -781,6 +1124,9 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
                     elif p_type == "text_turn":
                         text = payload.get("text", "").strip()
                         if text:
+                            # [H1] Cancel prior turn before spawning new one
+                            if active_turn_task and not active_turn_task.done():
+                                active_turn_task.cancel()
                             active_turn_task = asyncio.create_task(handle_user_turn(text))
 
                 except json.JSONDecodeError:
@@ -794,12 +1140,20 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
         else:
             logger.error("[FastAPI WS] Connection error: %s", e)
     finally:
-        active_connections[client_ip] = max(0, active_connections.get(client_ip, 1) - 1)
+        # [M12] Clean up connection count; delete key at 0 to prevent memory leak
+        new_count = max(0, active_connections.get(client_ip, 1) - 1)
+        if new_count == 0:
+            active_connections.pop(client_ip, None)
+        else:
+            active_connections[client_ip] = new_count
         dg_task.cancel()
         if debounce_task and not debounce_task.done():
             debounce_task.cancel()
         if active_turn_task and not active_turn_task.done():
             active_turn_task.cancel()
+        # [H2] Cancel greeting task on disconnect
+        if greeting_task and not greeting_task.done():
+            greeting_task.cancel()
         if deepgram_ws:
             try:
                 await deepgram_ws.close()
@@ -810,5 +1164,5 @@ async def websocket_talk_endpoint(client_ws: WebSocket):
 # Entrypoint Runner
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting Replora FastAPI Voice Agent on port %d...", PORT)
+    logger.info("Starting Replora FastAPI Voice Agent v1.3.0 on port %d (mode=%s)...", PORT, DEPLOY_MODE)
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)

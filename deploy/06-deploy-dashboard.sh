@@ -16,8 +16,8 @@ fi
 echo "=== [2/3] Launching bundled Studio UI in Node 20 container ==="
 # Launch bundled Studio UI so Node.js is not strictly required on the host system
 docker run -d --name rumik-voice-studio --restart unless-stopped \
-  -p 8787:8787 --env-file .env \
-  -v "$PWD/dashboard:/app" -w /app node:20-alpine node server.js
+  -p 127.0.0.1:8787:8787 --env-file .env \
+  -v "$PWD/dashboard:/app" -w /app node:20-alpine sh -c "npx tsx server.ts"
 
 echo "=== [3/3] Checking Studio UI health ==="
 RETRIES=15

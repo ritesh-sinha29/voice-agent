@@ -83,7 +83,10 @@ export default function Settings({ activeOrg, organizations, currentUser }: Sett
       return;
     }
 
-    const code = `inv_${Math.random().toString(36).substring(2, 10)}`;
+    // [M2] Use crypto.getRandomValues() for secure invite tokens instead of Math.random()
+    const randomBytes = new Uint8Array(8);
+    crypto.getRandomValues(randomBytes);
+    const code = `inv_${Array.from(randomBytes, b => b.toString(16).padStart(2, '0')).join('')}`;
     setInviteGenerated(`https://studio.rumik.ai/join?token=${code}&org=${activeOrg.id}`);
     setInviteEmail('');
   };

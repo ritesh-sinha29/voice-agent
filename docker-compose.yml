@@ -6,7 +6,7 @@ services:
     container_name: fastapi-voice-agent
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"  # [M5] Bind to localhost only
     env_file:
       - .env
     environment:
@@ -31,7 +31,7 @@ services:
     container_name: rumik-voice-studio
     restart: unless-stopped
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"  # [M5] Bind to localhost only
     env_file:
       - .env
     volumes:
